@@ -57,7 +57,8 @@ jobs:
 
       - name: Build and push reproducible image
         run: |
-          ./docker/build.sh --push "${{ env.IMAGE_REFERENCE }}"
+          IMAGE=${{ env.IMAGE_REFERENCE }} ./docker/build.sh
+          docker push "${{ env.IMAGE_REFERENCE }}"
 
       - name: Get image digest
         run: |
