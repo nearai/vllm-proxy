@@ -4,7 +4,15 @@ from hashlib import sha256
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Header, Query
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Header,
+    Query,
+)
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -34,6 +42,7 @@ router = APIRouter(tags=["openai"])
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8000")
 VLLM_URL = f"{VLLM_BASE_URL}/v1/chat/completions"
 VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
+VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 TIMEOUT = 60 * 10
@@ -226,7 +235,9 @@ async def attestation_report(
 
     # If signing_address is specified and doesn't match this server's address, return 404
     if signing_address and context.signing_address.lower() != signing_address.lower():
-        raise HTTPException(status_code=404, detail="Signing address not found on this server")
+        raise HTTPException(
+            status_code=404, detail="Signing address not found on this server"
+        )
     try:
         attestation = generate_attestation(context, nonce)
     except ValueError as exc:
@@ -297,6 +308,21 @@ async def completions(
         return JSONResponse(content=response_data)
 
 
+@router.post("/embeddings", dependencies=[Depends(verify_authorization_header)])
+async def embeddings(request: Request):
+    # Forward request body to vLLM
+    request_body = await request.body()
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(TIMEOUT), headers=COMMON_HEADERS
+    ) as client:
+        response = await client.post(VLLM_EMBEDDINGS_URL, content=request_body)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        return JSONResponse(content=response.json())
+
+
 # Get signature for chat_id of chat history
 @router.get("/signature/{chat_id}", dependencies=[Depends(verify_authorization_header)])
 async def signature(request: Request, chat_id: str, signing_algo: str = None):
@@ -346,6 +372,15 @@ async def metrics(request: Request):
 async def models(request: Request):
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
         response = await client.get(VLLM_MODELS_URL)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return JSONResponse(content=response.json())
+
+
+@router.get("/version")
+async def version(request: Request):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
+        response = await client.get(f"{VLLM_BASE_URL}/version")
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return JSONResponse(content=response.json())
