@@ -100,7 +100,7 @@ async def stream_vllm_response(
                     chunk_data = json.loads(data)
                     chat_id = chunk_data.get("id")
                 except Exception as e:
-                    error_message = f"Failed to parse the first chunk: {e}\n The original data is: {data}"
+                    error_message = f"Failed to parse the first chunk: {type(e).__name__}: {e}"
                     log.error(error_message)
                     raise Exception(error_message)
 
@@ -170,7 +170,7 @@ async def non_stream_vllm_response(
     ) as client:
         response = await client.post(url, content=modified_request_body)
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
+            raise HTTPException(status_code=response.status_code, detail="Upstream service error")
 
         response_data = response.json()
         # Cache the request-response pair using the chat ID
@@ -311,8 +311,8 @@ async def signature(request: Request, chat_id: str, signing_algo: str = None):
     try:
         value = json.loads(cache_value)
     except Exception as e:
-        log.error(f"Failed to parse the cache value: {cache_value} {e}")
-        return unexpect_error("Failed to parse the cache value", e)
+        log.error(f"Failed to parse cache value for chat_id={chat_id}: {type(e).__name__}")
+        return unexpect_error("Failed to parse the cache value")
 
     signing_address = None
     if signing_algo == ECDSA:
@@ -338,7 +338,7 @@ async def metrics(request: Request):
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
         response = await client.get(VLLM_METRICS_URL)
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch metrics")
         return PlainTextResponse(response.text)
 
 
@@ -347,5 +347,5 @@ async def models(request: Request):
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
         response = await client.get(VLLM_MODELS_URL)
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch models")
         return JSONResponse(content=response.json())
