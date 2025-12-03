@@ -21,10 +21,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     """
     # handle HTTPException
     if isinstance(exc, HTTPException):
-        log.error(f"HTTPException: {exc.detail}")
+        log.error(f"HTTPException: status={exc.status_code}")
         return http_exception(exc.status_code, exc.detail)
 
-    log.error(f"Unhandled exception: {exc}")
+    log.error(f"Unhandled exception: {type(exc).__name__}")
     return error(
         status_code=500,
         message=str(exc),
