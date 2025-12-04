@@ -318,7 +318,7 @@ async def tokenize(request: Request):
         if response.status_code != 200:
             raise HTTPException(
                 status_code=response.status_code,
-                detail=response.text
+                detail="Failed to tokenize"
             )
 
         return JSONResponse(content=response.json())
