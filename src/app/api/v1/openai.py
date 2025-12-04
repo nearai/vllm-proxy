@@ -34,6 +34,7 @@ router = APIRouter(tags=["openai"])
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8000")
 VLLM_URL = f"{VLLM_BASE_URL}/v1/chat/completions"
 VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
+VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/v1/tokenize"
 VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 TIMEOUT = 60 * 10
@@ -295,6 +296,30 @@ async def completions(
             VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
         )
         return JSONResponse(content=response_data)
+
+
+# VLLM tokenize
+@router.post("/tokenize", dependencies=[Depends(verify_authorization_header)])
+async def tokenize(request: Request):
+    """
+    Proxy tokenization requests to vLLM backend.
+    """
+    request_body = await request.body()
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.post(
+            VLLM_TOKENIZE_URL,
+            content=request_body,
+            headers=COMMON_HEADERS,
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=response.text
+            )
+
+        return JSONResponse(content=response.json())
 
 
 # Get signature for chat_id of chat history
