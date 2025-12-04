@@ -34,10 +34,11 @@ router = APIRouter(tags=["openai"])
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8000")
 VLLM_URL = f"{VLLM_BASE_URL}/v1/chat/completions"
 VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
-VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/v1/tokenize"
+VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/tokenize"
 VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 TIMEOUT = 60 * 10
+TIMEOUT_TOKENIZE = 10
 
 COMMON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 
@@ -306,11 +307,12 @@ async def tokenize(request: Request):
     """
     request_body = await request.body()
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(TIMEOUT_TOKENIZE), headers=COMMON_HEADERS
+    ) as client:
         response = await client.post(
             VLLM_TOKENIZE_URL,
-            content=request_body,
-            headers=COMMON_HEADERS,
+            content=request_body
         )
 
         if response.status_code != 200:
