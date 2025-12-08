@@ -1,4 +1,7 @@
+import os
+
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .api import router as api_router
 from .api.response.response import ok, error, http_exception
@@ -7,10 +10,33 @@ from .logger import log
 app = FastAPI()
 app.include_router(api_router)
 
+GIT_REV_PATH = "/etc/.GIT_REV"
+
+
+def _read_git_rev() -> str:
+    """Read git revision from /etc/.GIT_REV file."""
+    try:
+        if os.path.exists(GIT_REV_PATH):
+            with open(GIT_REV_PATH, "r") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+GIT_REV = _read_git_rev()
+
 
 @app.get("/")
 async def root():
     return ok()
+
+
+@app.get("/version")
+async def show_version():
+    """Return version information for this vllm-proxy instance."""
+    ver = {"version": GIT_REV, "type": "proxy"}
+    return JSONResponse(content=ver)
 
 
 # Custom global error handler
