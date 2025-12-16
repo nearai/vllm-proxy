@@ -45,15 +45,15 @@ COMMON_HEADERS = {"Content-Type": "application/json", "Accept": "application/jso
 # Connection pool limits - tune based on expected load
 # max_connections: total concurrent connections to vLLM backend
 # max_keepalive_connections: connections kept alive for reuse
-try:
-    MAX_CONNECTIONS = int(os.getenv("VLLM_PROXY_MAX_CONNECTIONS", "1000"))
-except ValueError:
-    MAX_CONNECTIONS = 1000
+def _get_env_as_int(name: str, default: int) -> int:
+    """Safely gets an environment variable as an integer, falling back to a default."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
 
-try:
-    MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("VLLM_PROXY_MAX_KEEPALIVE", "100"))
-except ValueError:
-    MAX_KEEPALIVE_CONNECTIONS = 100
+MAX_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_CONNECTIONS", 1000)
+MAX_KEEPALIVE_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_KEEPALIVE", 100)
 
 _http_client: Optional[httpx.AsyncClient] = None
 
