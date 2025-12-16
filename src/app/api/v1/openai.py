@@ -28,6 +28,10 @@ from app.quote.quote import (
     generate_attestation,
     sign_message,
 )
+from app.encryption.encryption import (
+    encrypt_data,
+    decrypt_data,
+)
 
 router = APIRouter(tags=["openai"])
 
@@ -67,17 +71,24 @@ async def stream_vllm_response(
     request_body: bytes,
     modified_request_body: bytes,
     request_hash: Optional[str] = None,
+    encrypt_response: bool = False,
+    client_public_key: Optional[str] = None,
+    signing_algo: Optional[str] = None,
 ):
     """
     Handle streaming vllm request
     Args:
+        url: The vllm backend URL
         request_body: The original request body
         modified_request_body: The modified enhanced request body
         request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
                      pre-calculated request hash, avoiding redundant hash computation. Falls back to
                      calculating hash from request_body if not provided
+        encrypt_response: Whether to encrypt the response chunks
+        client_public_key: Client's public key for encryption (required if encrypt_response=True)
+        signing_algo: Signing algorithm for encryption (required if encrypt_response=True)
     Returns:
-        A streaming response
+        A streaming response (encrypted if encrypt_response=True)
     """
     if request_hash:
         request_sha256 = request_hash
@@ -106,7 +117,20 @@ async def stream_vllm_response(
                     log.error(error_message)
                     raise Exception(error_message)
 
-            yield chunk
+            # Encrypt chunk if needed
+            if encrypt_response and client_public_key and signing_algo:
+                try:
+                    # Encrypt the chunk bytes
+                    chunk_bytes = chunk.encode("utf-8")
+                    encrypted_chunk = encrypt_data(chunk_bytes, client_public_key, signing_algo)
+                    # Format as: data: {"encrypted_data": "hex_string"}\n\n
+                    yield f'data: {{"encrypted_data": "{encrypted_chunk.hex()}"}}\n\n'
+                except Exception as e:
+                    log.error(f"Failed to encrypt chunk: {e}")
+                    # Yield error chunk
+                    yield f'data: {{"error": "Encryption failed: {str(e)}"}}\n\n'
+            else:
+                yield chunk
 
         response_sha256 = h.hexdigest()
         # Cache the full request and response using the extracted cache key
@@ -267,6 +291,118 @@ async def chat_completions(
             VLLM_URL, request_body, modified_request_body, x_request_hash
         )
         return JSONResponse(content=response_data)
+
+
+# Encrypted VLLM Chat completions
+@router.post("/encrypted/chat/completions", dependencies=[Depends(verify_authorization_header)])
+async def encrypted_chat_completions(
+    request: Request,
+    x_signing_algo: str = Header(..., alias="X-Signing-Algo"),
+    x_signing_pub_key: str = Header(..., alias="X-Signing-Pub-Key"),
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+):
+    """
+    Encrypted chat completions endpoint.
+    
+    Requires:
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required)
+    - X-Signing-Pub-Key: Client's public key in hex format (required)
+    
+    Request body: Encrypted data (hex-encoded bytes)
+    Response: Encrypted data in {"encrypted_data": "hex_string"} format
+    """
+    # Validate signing algorithm
+    if x_signing_algo not in [ECDSA, ED25519]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
+        )
+    
+    # Get the signing context for decryption
+    context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+    
+    # Get and decrypt the request body
+    encrypted_request_body = await request.body()
+    
+    # Parse hex-encoded encrypted data if it's a JSON wrapper
+    try:
+        # Try to parse as JSON first (in case client sends {"encrypted_data": "hex"})
+        request_json_wrapper = json.loads(encrypted_request_body)
+        if "encrypted_data" in request_json_wrapper:
+            encrypted_data_hex = request_json_wrapper["encrypted_data"]
+            encrypted_request_body = bytes.fromhex(encrypted_data_hex)
+    except (json.JSONDecodeError, ValueError, KeyError):
+        # If not JSON, assume it's raw hex-encoded bytes
+        try:
+            encrypted_request_body = bytes.fromhex(encrypted_request_body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            # If that fails, assume it's already bytes (for direct binary upload)
+            pass
+    
+    # Decrypt the request body
+    try:
+        decrypted_body = decrypt_data(encrypted_request_body, context)
+        log.debug("Request body decrypted successfully")
+    except Exception as e:
+        log.error(f"Failed to decrypt request body: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to decrypt request body: {str(e)}"
+        )
+    
+    # Parse the decrypted request body
+    try:
+        request_json = json.loads(decrypted_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON in decrypted request body: {str(e)}"
+        )
+
+    modified_json = strip_empty_tool_calls(request_json)
+
+    # Check if the request is for streaming or non-streaming
+    is_stream = modified_json.get(
+        "stream", False
+    )  # Default to non-streaming if not specified
+
+    modified_request_body = json.dumps(modified_json).encode("utf-8")
+    
+    if is_stream:
+        # Create an encrypted streaming response using shared function
+        return await stream_vllm_response(
+            VLLM_URL,
+            decrypted_body,  # Use decrypted body for hash calculation
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=True,
+            client_public_key=x_signing_pub_key,
+            signing_algo=x_signing_algo,
+        )
+    else:
+        # Handle non-streaming encrypted response using shared function
+        response_data = await non_stream_vllm_response(
+            VLLM_URL,
+            decrypted_body,  # Use decrypted body for hash calculation
+            modified_request_body,
+            x_request_hash,
+        )
+        
+        # Encrypt the response
+        try:
+            encrypted_response = encrypt_data(
+                json.dumps(response_data).encode("utf-8"),
+                x_signing_pub_key,
+                x_signing_algo,
+            )
+            # Return encrypted response as hex string in a JSON wrapper
+            return JSONResponse(content={"encrypted_data": encrypted_response.hex()})
+        except Exception as e:
+            log.error(f"Failed to encrypt response: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to encrypt response: {str(e)}"
+            )
 
 
 # VLLM completions

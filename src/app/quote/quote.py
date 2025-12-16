@@ -26,6 +26,7 @@ class SigningContext:
     method: str
     signing_address: str
     signing_address_bytes: bytes
+    signing_public_key: str
     _ed_private: Optional[Ed25519PrivateKey] = None
     _raw_account: Optional[web3.Account] = None
 
@@ -112,10 +113,12 @@ def _create_ed25519_context() -> SigningContext:
         format=serialization.PublicFormat.Raw,
     )
     signing_address = public_key_bytes.hex()
+    signing_public_key = public_key_bytes.hex()
     return SigningContext(
         method=ED25519,
         signing_address=signing_address,
         signing_address_bytes=public_key_bytes,
+        signing_public_key=signing_public_key,
         _ed_private=private_key,
     )
 
@@ -126,10 +129,13 @@ def _create_ecdsa_context() -> SigningContext:
     signing_address = account.address
     # Use the 20-byte Ethereum address for attestation (standard verification identifier)
     address_bytes = bytes.fromhex(signing_address[2:])  # Remove '0x' prefix
+    public_key_bytes = account._key_obj.public_key.to_bytes()
+    signing_public_key = public_key_bytes.hex()
     return SigningContext(
         method=ECDSA,
         signing_address=signing_address,
         signing_address_bytes=address_bytes,
+        signing_public_key=signing_public_key,
         _raw_account=account,
     )
 
@@ -166,6 +172,7 @@ def generate_attestation(
     return dict(
         signing_address=context.signing_address,
         signing_algo=context.method,
+        signing_public_key=context.signing_public_key,
         request_nonce=request_nonce_hex,
         intel_quote=quote_result.quote,
         nvidia_payload=nvidia_payload,
