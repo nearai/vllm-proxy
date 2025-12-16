@@ -1,14 +1,13 @@
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .api import router as api_router
-from .api.response.response import ok, error, http_exception
+from .api.response.response import error, http_exception, ok
+from .api.v1.openai import close_http_client, get_http_client
 from .logger import log
-
-app = FastAPI()
-app.include_router(api_router)
 
 GIT_REV_PATH = "/etc/.GIT_REV"
 
@@ -25,6 +24,24 @@ def _read_git_rev() -> str:
 
 
 GIT_REV = _read_git_rev()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown."""
+    # Startup: initialize the HTTP client pool
+    log.info("Initializing HTTP client pool...")
+    get_http_client()
+    log.info("HTTP client pool initialized")
+    yield
+    # Shutdown: close the HTTP client pool
+    log.info("Closing HTTP client pool...")
+    await close_http_client()
+    log.info("HTTP client pool closed")
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(api_router)
 
 
 @app.get("/")

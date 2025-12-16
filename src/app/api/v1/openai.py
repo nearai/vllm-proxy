@@ -4,12 +4,12 @@ from hashlib import sha256
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Header, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
-    StreamingResponse,
     Response,
+    StreamingResponse,
 )
 
 from app.api.helper.auth import verify_authorization_header
@@ -41,6 +41,45 @@ TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
 COMMON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
+
+# Connection pool limits - tune based on expected load
+# max_connections: total concurrent connections to vLLM backend
+# max_keepalive_connections: connections kept alive for reuse
+def _get_env_as_int(name: str, default: int) -> int:
+    """Safely gets an environment variable as an integer, falling back to a default."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+MAX_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_CONNECTIONS", 1000)
+MAX_KEEPALIVE_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_KEEPALIVE", 100)
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Get or create the shared HTTP client with connection pooling."""
+    global _http_client
+    if _http_client is None:
+        limits = httpx.Limits(
+            max_connections=MAX_CONNECTIONS,
+            max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+        )
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(TIMEOUT),
+            headers=COMMON_HEADERS,
+            limits=limits,
+        )
+    return _http_client
+
+
+async def close_http_client():
+    """Close the shared HTTP client. Call on app shutdown."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 def sign_request(request: dict, response: str):
@@ -91,35 +130,41 @@ async def stream_vllm_response(
 
     async def generate_stream(response):
         nonlocal chat_id, h
-        async for chunk in response.aiter_text():
-            h.update(chunk.encode())
-            # Extract the cache key (data.id) from the first chunk
-            if not chat_id:
-                data = chunk.strip("data: ").strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    chunk_data = json.loads(data)
-                    chat_id = chunk_data.get("id")
-                except Exception as e:
-                    error_message = f"Failed to parse the first chunk: {type(e).__name__}: {e}"
-                    log.error(error_message)
-                    raise Exception(error_message)
+        try:
+            async for chunk in response.aiter_text():
+                h.update(chunk.encode())
+                # Extract the cache key (data.id) from the first chunk
+                if not chat_id:
+                    data = chunk.strip("data: ").strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        chunk_data = json.loads(data)
+                        chat_id = chunk_data.get("id")
+                    except Exception as e:
+                        error_message = (
+                            f"Failed to parse the first chunk: {type(e).__name__}: {e}"
+                        )
+                        log.error(error_message)
+                        raise Exception(error_message)
 
-            yield chunk
+                yield chunk
 
-        response_sha256 = h.hexdigest()
-        # Cache the full request and response using the extracted cache key
-        if chat_id:
-            cache.set_chat(
-                chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-            )
-        else:
-            error_message = "Chat id could not be extracted from the response"
-            log.error(error_message)
-            raise Exception(error_message)
+            response_sha256 = h.hexdigest()
+            # Cache the full request and response using the extracted cache key
+            if chat_id:
+                cache.set_chat(
+                    chat_id,
+                    json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+                )
+            else:
+                error_message = "Chat id could not be extracted from the response"
+                log.error(error_message)
+                raise Exception(error_message)
+        finally:
+            await response.aclose()
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT), headers=COMMON_HEADERS)
+    client = get_http_client()
     # Forward the request to the vllm backend
     req = client.build_request("POST", url, content=modified_request_body)
     response = await client.send(req, stream=True)
@@ -127,7 +172,6 @@ async def stream_vllm_response(
     if response.status_code != 200:
         error_content = await response.aread()
         await response.aclose()
-        await client.aclose()
 
         return Response(
             content=error_content,
@@ -137,7 +181,6 @@ async def stream_vllm_response(
 
     return StreamingResponse(
         generate_stream(response),
-        background=BackgroundTasks([response.aclose, client.aclose]),
         media_type="text/event-stream",
     )
 
@@ -167,25 +210,25 @@ async def non_stream_vllm_response(
         request_sha256 = sha256(request_body).hexdigest()
         log.debug(f"Calculated request hash: {request_sha256}")
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(TIMEOUT), headers=COMMON_HEADERS
-    ) as client:
-        response = await client.post(url, content=modified_request_body)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Upstream service error")
+    client = get_http_client()
+    response = await client.post(url, content=modified_request_body)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
 
-        response_data = response.json()
-        # Cache the request-response pair using the chat ID
-        chat_id = response_data.get("id")
-        if chat_id:
-            response_sha256 = sha256(response.content).hexdigest()
-            cache.set_chat(
-                chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-            )
-        else:
-            raise Exception("Chat id could not be extracted from the response")
+    response_data = response.json()
+    # Cache the request-response pair using the chat ID
+    chat_id = response_data.get("id")
+    if chat_id:
+        response_sha256 = sha256(response.content).hexdigest()
+        cache.set_chat(
+            chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        )
+    else:
+        raise Exception("Chat id could not be extracted from the response")
 
-        return response_data
+    return response_data
 
 
 def strip_empty_tool_calls(payload: dict) -> dict:
@@ -228,7 +271,9 @@ async def attestation_report(
 
     # If signing_address is specified and doesn't match this server's address, return 404
     if signing_address and context.signing_address.lower() != signing_address.lower():
-        raise HTTPException(status_code=404, detail="Signing address not found on this server")
+        raise HTTPException(
+            status_code=404, detail="Signing address not found on this server"
+        )
     try:
         attestation = generate_attestation(context, nonce)
     except ValueError as exc:
@@ -307,21 +352,19 @@ async def tokenize(request: Request):
     """
     request_body = await request.body()
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(TIMEOUT_TOKENIZE), headers=COMMON_HEADERS
-    ) as client:
-        response = await client.post(
-            VLLM_TOKENIZE_URL,
-            content=request_body
+    client = get_http_client()
+    response = await client.post(
+        VLLM_TOKENIZE_URL,
+        content=request_body,
+        timeout=httpx.Timeout(TIMEOUT_TOKENIZE),
+    )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code, detail="Failed to tokenize"
         )
 
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail="Failed to tokenize"
-            )
-
-        return JSONResponse(content=response.json())
+    return JSONResponse(content=response.json())
 
 
 # Get signature for chat_id of chat history
@@ -338,7 +381,9 @@ async def signature(request: Request, chat_id: str, signing_algo: str = None):
     try:
         value = json.loads(cache_value)
     except Exception as e:
-        log.error(f"Failed to parse cache value for chat_id={chat_id}: {type(e).__name__}")
+        log.error(
+            f"Failed to parse cache value for chat_id={chat_id}: {type(e).__name__}"
+        )
         return unexpect_error("Failed to parse the cache value")
 
     signing_address = None
@@ -362,17 +407,21 @@ async def signature(request: Request, chat_id: str, signing_algo: str = None):
 # Metrics of vLLM instance
 @router.get("/metrics")
 async def metrics(request: Request):
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
-        response = await client.get(VLLM_METRICS_URL)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Failed to fetch metrics")
-        return PlainTextResponse(response.text)
+    client = get_http_client()
+    response = await client.get(VLLM_METRICS_URL)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code, detail="Failed to fetch metrics"
+        )
+    return PlainTextResponse(response.text)
 
 
 @router.get("/models")
 async def models(request: Request):
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as client:
-        response = await client.get(VLLM_MODELS_URL)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Failed to fetch models")
-        return JSONResponse(content=response.json())
+    client = get_http_client()
+    response = await client.get(VLLM_MODELS_URL)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code, detail="Failed to fetch models"
+        )
+    return JSONResponse(content=response.json())
