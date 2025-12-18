@@ -13,6 +13,7 @@ class SigningContext:
     method: str
     signing_address: str
     attested_key_bytes: bytes
+    signing_public_key: str = ""
 
     def sign(self, content: str) -> str:
         if self.method == ECDSA:
@@ -20,8 +21,8 @@ class SigningContext:
         return f"mocked_{content}"
 
 
-ed25519_context = SigningContext(ED25519, "11" * 32, b"\x01" * 32)
-ecdsa_context = SigningContext(ECDSA, "0xMockECDSAAddress", b"\x02" * 32)
+ed25519_context = SigningContext(ED25519, "11" * 32, b"\x01" * 32, "11" * 32)  # 64 hex chars (32 bytes)
+ecdsa_context = SigningContext(ECDSA, "0xMockECDSAAddress", b"\x02" * 32, "02" * 64)  # 128 hex chars (64 bytes)
 
 
 def sign_message(context: SigningContext, content: str) -> str:

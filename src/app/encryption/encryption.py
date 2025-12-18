@@ -2,7 +2,7 @@
 Encryption utilities for end-to-end encryption using ECDSA and Ed25519 signing keys.
 
 For ECDSA: Uses ECIES (Elliptic Curve Integrated Encryption Scheme)
-For Ed25519: Uses X25519 key exchange + AES-GCM encryption
+For Ed25519: Uses PyNaCl Box (X25519 key exchange + ChaCha20-Poly1305 encryption)
 """
 
 import json
@@ -18,6 +18,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
+from nacl.public import PrivateKey as X25519PrivateKeyNaCl, PublicKey as X25519PublicKeyNaCl, Box
+from nacl import bindings
 from app.logger import log
 from app.quote.quote import (
     SigningContext,
@@ -28,77 +30,39 @@ from app.quote.quote import (
 )
 
 
-def _ed25519_to_x25519_private_key(
+def _ed25519_to_x25519_private_key_nacl(
     ed25519_private: ed25519.Ed25519PrivateKey,
-) -> X25519PrivateKey:
+) -> X25519PrivateKeyNaCl:
     """
-    Convert Ed25519 private key to X25519 private key.
+    Convert Ed25519 private key to PyNaCl X25519 private key using PyNaCl bindings.
     
-    Both Ed25519 and X25519 use Curve25519, but with different representations.
-    The private key (seed) can be shared, but needs proper clamping for X25519.
+    Uses PyNaCl's built-in conversion function which handles the clamping automatically.
     """
-    # Get the raw private key bytes (seed)
+    # Get the raw private key bytes (seed) - 32 bytes
     private_bytes = ed25519_private.private_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PrivateFormat.Raw,
         encryption_algorithm=serialization.NoEncryption(),
     )
     
-    # X25519 requires clamping: clear bits 0, 1, 2, and set bit 254
-    # This ensures the scalar is a valid X25519 private key
-    clamped = bytearray(private_bytes)
-    clamped[0] &= 0xF8  # Clear bottom 3 bits
-    clamped[31] &= 0x7F  # Clear top bit
-    clamped[31] |= 0x40  # Set second-highest bit
+    # Use PyNaCl's built-in conversion function
+    # crypto_sign_ed25519_sk_to_curve25519 converts Ed25519 secret key to X25519 secret key
+    x25519_private_bytes = bindings.crypto_sign_ed25519_sk_to_curve25519(private_bytes)
     
-    return X25519PrivateKey.from_private_bytes(bytes(clamped))
+    return X25519PrivateKeyNaCl(x25519_private_bytes)
 
 
-def _ed25519_to_x25519_public_key(ed25519_public_bytes: bytes) -> X25519PublicKey:
+def _ed25519_to_x25519_public_key_nacl(ed25519_public_bytes: bytes) -> X25519PublicKeyNaCl:
     """
-    Convert Ed25519 public key (Edwards coordinates) to X25519 public key (Montgomery coordinates).
+    Convert Ed25519 public key to PyNaCl X25519 public key using PyNaCl bindings.
     
-    Ed25519 uses Edwards form: (x, y) on curve edwards25519
-    X25519 uses Montgomery form: u on curve montgomery25519
-    
-    Both curves are birationally equivalent forms of Curve25519.
-    
-    Conversion formula: u = (1 + y) / (1 - y) mod p
-    where p = 2^255 - 19
-    
-    Ed25519 public key format: 32 bytes encoding y-coordinate (little-endian)
-    with sign bit of x in the most significant bit of the last byte.
+    Uses PyNaCl's built-in conversion function for Edwards to Montgomery coordinate conversion.
     """
-    # Ed25519 public key bytes encode the y-coordinate in compressed format
-    # The format is: y (255 bits, little-endian) with sign(x) in bit 255
+    # Use PyNaCl's built-in conversion function
+    # crypto_sign_ed25519_pk_to_curve25519 converts Ed25519 public key to X25519 public key
+    x25519_public_bytes = bindings.crypto_sign_ed25519_pk_to_curve25519(ed25519_public_bytes)
     
-    # Extract y-coordinate (clear the sign bit)
-    y_bytes = bytearray(ed25519_public_bytes)
-    y_bytes[31] &= 0x7F  # Clear the sign bit (most significant bit)
-    
-    # Convert y-coordinate from little-endian bytes to integer
-    y = int.from_bytes(y_bytes, byteorder="little")
-    
-    # Curve25519 prime: p = 2^255 - 19
-    p = 2**255 - 19
-    
-    # Convert from Edwards to Montgomery: u = (1 + y) / (1 - y) mod p
-    # Handle edge case: if y == 1, then 1 - y == 0, which would cause division by zero
-    # In practice, y == 1 corresponds to the identity point, which maps to u = 0
-    if y == 1:
-        u = 0
-    else:
-        # Compute 1 - y mod p
-        one_minus_y = (1 - y) % p
-        # Compute modular inverse using Fermat's little theorem: a^(p-2) mod p
-        inv_one_minus_y = pow(one_minus_y, p - 2, p)
-        # Compute u = (1 + y) * inv(1 - y) mod p
-        u = ((1 + y) * inv_one_minus_y) % p
-    
-    # Convert u to bytes (little-endian, 32 bytes)
-    u_bytes = u.to_bytes(32, byteorder="little")
-    
-    return X25519PublicKey.from_public_bytes(u_bytes)
+    return X25519PublicKeyNaCl(x25519_public_bytes)
 
 
 def encrypt_data(data: bytes, public_key_hex: str, signing_algo: str) -> bytes:
@@ -141,7 +105,7 @@ def decrypt_data(encrypted_data: bytes, context: SigningContext) -> bytes:
 
 
 def _encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
-    """Encrypt data using Ed25519 public key (via X25519 key exchange)."""
+    """Encrypt data using Ed25519 public key via PyNaCl Box (X25519 + ChaCha20-Poly1305)."""
     try:
         # Parse public key from hex
         public_key_bytes = bytes.fromhex(public_key_hex)
@@ -150,80 +114,55 @@ def _encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
                 f"Ed25519 public key must be 32 bytes, got {len(public_key_bytes)}"
             )
 
-        # Convert to X25519 public key
-        x25519_public = _ed25519_to_x25519_public_key(public_key_bytes)
+        # Convert Ed25519 public key to X25519 public key (PyNaCl format)
+        x25519_public = _ed25519_to_x25519_public_key_nacl(public_key_bytes)
 
-        # Generate ephemeral X25519 key pair
-        ephemeral_private = X25519PrivateKey.generate()
-        ephemeral_public = ephemeral_private.public_key()
+        # Generate ephemeral X25519 key pair using PyNaCl
+        ephemeral_private = X25519PrivateKeyNaCl.generate()
+        ephemeral_public = ephemeral_private.public_key
 
-        # Perform key exchange
-        shared_secret = ephemeral_private.exchange(x25519_public)
+        # Create Box for encryption (sender uses ephemeral private, recipient uses their public)
+        box = Box(ephemeral_private, x25519_public)
 
-        # Derive AES key using HKDF
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b"ed25519_encryption",
-            backend=default_backend(),
-        )
-        aes_key = hkdf.derive(shared_secret)
+        # Encrypt using PyNaCl Box (automatically generates nonce and uses ChaCha20-Poly1305)
+        # Box.encrypt returns: [nonce (24 bytes)][ciphertext]
+        encrypted = box.encrypt(data)
 
-        # Encrypt with AES-GCM
-        nonce = os.urandom(12)
-        aesgcm = AESGCM(aes_key)
-        ciphertext = aesgcm.encrypt(nonce, data, None)
-
-        # Format: [ephemeral_public_key (32 bytes)][nonce (12 bytes)][ciphertext]
-        ephemeral_public_bytes = ephemeral_public.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-        return ephemeral_public_bytes + nonce + ciphertext
+        # Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
+        # PyNaCl Box uses 24-byte nonce (included in encrypted output)
+        ephemeral_public_bytes = bytes(ephemeral_public)
+        return ephemeral_public_bytes + encrypted
     except Exception as e:
         log.error(f"Ed25519 encryption failed: {e}")
         raise
 
 
 def _decrypt_ed25519(encrypted_data: bytes, context: SigningContext) -> bytes:
-    """Decrypt data using Ed25519 private key."""
+    """Decrypt data using Ed25519 private key via PyNaCl Box."""
     try:
         if context._ed_private is None:
             raise ValueError("Ed25519 context not properly initialized")
 
-        if (
-            len(encrypted_data) < 44
-        ):  # 32 (ephemeral public) + 12 (nonce) + at least some ciphertext
+        # Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
+        # Minimum: 32 (ephemeral public) + 24 (nonce) + 0 (empty ciphertext) = 56 bytes
+        if len(encrypted_data) < 56:
             raise ValueError("Encrypted data too short")
 
         # Extract components
         ephemeral_public_bytes = encrypted_data[:32]
-        nonce = encrypted_data[32:44]
-        ciphertext = encrypted_data[44:]
+        box_encrypted = encrypted_data[32:]  # Contains [nonce (24 bytes)][ciphertext]
 
-        # Convert Ed25519 private to X25519 private
-        x25519_private = _ed25519_to_x25519_private_key(context._ed_private)
+        # Convert Ed25519 private to X25519 private (PyNaCl format)
+        x25519_private = _ed25519_to_x25519_private_key_nacl(context._ed_private)
 
-        # Convert ephemeral public key to X25519
-        ephemeral_public = X25519PublicKey.from_public_bytes(ephemeral_public_bytes)
+        # Convert ephemeral public key to X25519 (PyNaCl format)
+        ephemeral_public = X25519PublicKeyNaCl(ephemeral_public_bytes)
 
-        # Perform key exchange
-        shared_secret = x25519_private.exchange(ephemeral_public)
+        # Create Box for decryption (recipient uses their private, sender's ephemeral public)
+        box = Box(x25519_private, ephemeral_public)
 
-        # Derive AES key using HKDF
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b"ed25519_encryption",
-            backend=default_backend(),
-        )
-        aes_key = hkdf.derive(shared_secret)
-
-        # Decrypt with AES-GCM
-        aesgcm = AESGCM(aes_key)
-        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        # Decrypt using PyNaCl Box (automatically extracts nonce and verifies Poly1305 tag)
+        plaintext = box.decrypt(box_encrypted)
 
         return plaintext
     except Exception as e:
