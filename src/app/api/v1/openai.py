@@ -389,90 +389,41 @@ async def attestation_report(
 async def chat_completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
-):
-    # Keep original request body to calculate the request hash for attestation
-    request_body = await request.body()
-    request_json = json.loads(request_body)
-    modified_json = strip_empty_tool_calls(request_json)
-
-    # Check if the request is for streaming or non-streaming
-    is_stream = modified_json.get(
-        "stream", False
-    )  # Default to non-streaming if not specified
-
-    modified_request_body = json.dumps(modified_json).encode("utf-8")
-    if is_stream:
-        # Create a streaming response
-        return await stream_vllm_response(
-            VLLM_URL, request_body, modified_request_body, x_request_hash
-        )
-    else:
-        # Handle non-streaming response
-        response_data = await non_stream_vllm_response(
-            VLLM_URL, request_body, modified_request_body, x_request_hash
-        )
-        return JSONResponse(content=response_data)
-
-
-# Encrypted VLLM Chat completions
-@router.post("/encrypted/chat/completions", dependencies=[Depends(verify_authorization_header)])
-async def encrypted_chat_completions(
-    request: Request,
-    x_signing_algo: str = Header(..., alias="X-Signing-Algo"),
-    x_signing_pub_key: str = Header(..., alias="X-Signing-Pub-Key"),
-    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_signing_pub_key: Optional[str] = Header(None, alias="X-Signing-Pub-Key"),
 ):
     """
-    Encrypted chat completions endpoint.
-    Only encrypts/decrypts message content, not the entire request/response body.
+    Chat completions endpoint with optional end-to-end encryption.
     
-    Requires:
-    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required)
-    - X-Signing-Pub-Key: Client's public key in hex format (required)
+    Supports both plain text and encrypted requests/responses.
     
-    Request body format:
-    {
-        "model": "...",
-        "messages": [
-            {
-                "role": "user",
-                "content": "hex_string"  // Encrypted content as hex string (matches standard format)
-            }
-        ],
-        "stream": false,
-        ...
-    }
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Signing-Pub-Key: Client's public key in hex format (required if encryption is enabled)
     
-    Response format:
-    {
-        "id": "...",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": "hex_string"  // Encrypted content as hex string (matches standard format)
-                    "reasoning_content": "hex_string"  // Encrypted reasoning content as hex string (matches standard format)
-                },
-            }
-        ],
-        ...
-    }
+    When encryption is enabled:
+    - Request message content should be encrypted as hex strings
+    - Response message content will be encrypted as hex strings
+    - Only message content is encrypted, not the entire request/response body
     """
-    # Validate signing algorithm
-    if x_signing_algo not in [ECDSA, ED25519]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
-        )
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
     
-    # Get the signing context for decryption
-    context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+    if encrypt_enabled:
+        # Validate signing algorithm
+        if x_signing_algo not in [ECDSA, ED25519]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
+            )
+        
+        # Get the signing context for decryption
+        context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
     
     # Get the request body
     request_body = await request.body()
     
-    # Parse the request JSON (only message content is encrypted, not the entire body)
+    # Parse the request JSON
     try:
         request_json = json.loads(request_body)
     except json.JSONDecodeError as e:
@@ -481,8 +432,8 @@ async def encrypted_chat_completions(
             detail=f"Invalid JSON in request body: {str(e)}"
         )
     
-    # Decrypt message content in each message
-    if "messages" in request_json:
+    # Decrypt message content if encryption is enabled
+    if encrypt_enabled and "messages" in request_json:
         decrypted_messages = []
         for message in request_json["messages"]:
             try:
@@ -507,30 +458,31 @@ async def encrypted_chat_completions(
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
     
+    # Use decrypted body for hash calculation if encryption is enabled, otherwise use original
+    body_for_hash = modified_request_body if encrypt_enabled else request_body
+    
     if is_stream:
-        # Create an encrypted streaming response using shared function
+        # Create a streaming response
         return await stream_vllm_response(
             VLLM_URL,
-            modified_request_body,  # Use decrypted body for hash calculation
+            body_for_hash,
             modified_request_body,
             x_request_hash,
-            encrypt_response=True,
-            client_public_key=x_signing_pub_key,
-            signing_algo=x_signing_algo,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
-        # Handle non-streaming encrypted response using shared function
+        # Handle non-streaming response
         response_data = await non_stream_vllm_response(
             VLLM_URL,
-            modified_request_body,  # Use decrypted body for hash calculation
+            body_for_hash,
             modified_request_body,
             x_request_hash,
-            encrypt_response=True,
-            client_public_key=x_signing_pub_key,
-            signing_algo=x_signing_algo,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
-
-        # Response content is already encrypted by non_stream_vllm_response
         return JSONResponse(content=response_data)
 
 

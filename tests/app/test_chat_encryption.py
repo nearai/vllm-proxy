@@ -95,7 +95,7 @@ async def test_encrypted_chat_completions_non_streaming_ecdsa(respx_mock):
 
     # Make request with encryption headers
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -167,7 +167,7 @@ async def test_encrypted_chat_completions_non_streaming_ed25519(respx_mock):
 
     # Make request with encryption headers
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -229,7 +229,7 @@ async def test_encrypted_chat_completions_with_reasoning_content(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -317,7 +317,7 @@ async def test_encrypted_chat_completions_streaming(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -419,7 +419,7 @@ async def test_encrypted_chat_completions_streaming_with_reasoning(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -516,7 +516,7 @@ async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -563,32 +563,63 @@ async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
 
 
 @pytest.mark.asyncio
-async def test_encrypted_chat_completions_missing_headers():
-    """Test encrypted chat completions with missing required headers."""
+@pytest.mark.respx
+async def test_encrypted_chat_completions_partial_headers(respx_mock):
+    """Test that providing only one encryption header results in plain request (encryption disabled)."""
     request_data = {
         "model": "test-model",
         "messages": [{"role": "user", "content": "Hello"}],
         "stream": False,
     }
-
-    # Missing X-Signing-Algo
-    response = client.post(
-        "/v1/encrypted/chat/completions",
-        json=request_data,
-        headers={"Authorization": TEST_AUTH_HEADER},
+    
+    # Mock response
+    chat_id = "chatcmpl-plain-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Response"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
     )
-    assert response.status_code == 422  # Validation error
 
-    # Missing X-Signing-Pub-Key
+    # Missing X-Signing-Algo - should work as plain request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Pub-Key": "some-key",
+        },
+    )
+    assert response.status_code == 200
+    assert route.called
+    # Response should be plain text (not encrypted)
+    response_json = response.json()
+    assert response_json["choices"][0]["message"]["content"] == "Response"
+
+    # Missing X-Signing-Pub-Key - should work as plain request
+    response = client.post(
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
         },
     )
-    assert response.status_code == 422  # Validation error
+    assert response.status_code == 200
+    # Response should be plain text (not encrypted)
+    response_json = response.json()
+    assert response_json["choices"][0]["message"]["content"] == "Response"
 
 
 @pytest.mark.asyncio
@@ -601,7 +632,7 @@ async def test_encrypted_chat_completions_invalid_algo():
     }
 
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -618,14 +649,14 @@ async def test_encrypted_chat_completions_invalid_algo():
 @pytest.mark.asyncio
 @pytest.mark.respx
 async def test_encrypted_chat_completions_plain_text_content(respx_mock):
-    """Test that plain text content (not encrypted) is passed through."""
+    """Test that plain text content (not encrypted) is passed through when encryption headers are provided."""
     # Use plain text content (not encrypted hex string)
     request_data = {
         "model": "test-model",
         "messages": [{"role": "user", "content": "This is plain text, not encrypted"}],
         "stream": False,
     }
-
+    
     # Mock response
     chat_id = "chatcmpl-plain-123"
     response_data = {
@@ -641,14 +672,14 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
             }
         ],
     }
-
+    
     # Setup RESPX mock
     route = respx_mock.post(VLLM_URL).mock(
         return_value=httpx.Response(200, json=response_data)
     )
-
+    
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -656,10 +687,61 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
             "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
-
-    # Should succeed - plain text is treated as plain text
+    
+    # Should succeed - plain text is treated as plain text (not decrypted, but response will be encrypted)
     assert response.status_code == 200
     assert route.called
+    # Response should be encrypted since encryption headers were provided
+    response_json = response.json()
+    response_content = response_json["choices"][0]["message"]["content"]
+    assert isinstance(response_content, str)
+    assert len(response_content) >= 64  # Should be encrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_chat_completions_plain_request_no_encryption(respx_mock):
+    """Test that plain requests without encryption headers work correctly."""
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello, plain text"}],
+        "stream": False,
+    }
+    
+    # Mock response
+    chat_id = "chatcmpl-plain-no-enc-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Plain response"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+    
+    # Request without encryption headers
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+    
+    # Should succeed with plain text (no encryption)
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+    # Response should be plain text (not encrypted)
+    assert response_json["choices"][0]["message"]["content"] == "Plain response"
 
 
 @pytest.mark.asyncio
@@ -703,7 +785,7 @@ async def test_encrypted_chat_completions_multiple_messages(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -767,7 +849,7 @@ async def test_encrypted_chat_completions_empty_string_content(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
@@ -832,7 +914,7 @@ async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
 
     # Make request
     response = client.post(
-        "/v1/encrypted/chat/completions",
+        "/v1/chat/completions",
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
