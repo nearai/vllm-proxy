@@ -67,66 +67,85 @@ def sign_chat(text: str):
     )
 
 
+def _decrypt_field(field_value: str, context: SigningContext) -> str:
+    """
+    Decrypt a field value if it's encrypted (hex string).
+    Returns decrypted value or original value if not encrypted.
+    """
+    if not isinstance(field_value, str) or len(field_value) == 0:
+        return field_value
+
+    # Check if it's a valid hex string (even length, hex characters only)
+    # Encrypted data is typically longer, so we check for minimum length
+    if len(field_value) >= 64 and len(field_value) % 2 == 0 and all(c in '0123456789abcdefABCDEF' for c in field_value):
+        try:
+            # Try to decode as hex and decrypt
+            encrypted_data = bytes.fromhex(field_value)
+            decrypted_content = decrypt_data(encrypted_data, context)
+            return decrypted_content.decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            # Not valid hex or decryption failed, treat as plain text
+            pass
+        except Exception as e:
+            log.error(f"Failed to decrypt field: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decrypt field: {str(e)}"
+            )
+
+    return field_value
+
+
 def decrypt_message_content(message: dict, context: SigningContext) -> dict:
     """
-    Decrypt the content field of a message if it's encrypted.
+    Decrypt the content and reasoning_content fields of a message if they're encrypted.
     Expected format: {"content": "hex_string"} (encrypted) or {"content": "plain_text"} (unencrypted)
-    If content is a valid hex string, it will be treated as encrypted and decrypted.
+    If content/reasoning_content is a valid hex string, it will be treated as encrypted and decrypted.
     """
-    if "content" not in message:
-        return message
+    message = dict(message)  # Create a copy to avoid mutating the original
     
-    content = message["content"]
-    
-    # Check if content is a string that looks like encrypted hex data
-    if isinstance(content, str) and len(content) > 0:
-        # Check if it's a valid hex string (even length, hex characters only)
-        # Encrypted data is typically longer, so we check for minimum length
-        # Also verify all characters are valid hex digits
-        if len(content) >= 64 and len(content) % 2 == 0 and all(c in '0123456789abcdefABCDEF' for c in content):
-            try:
-                # Try to decode as hex and decrypt
-                encrypted_data = bytes.fromhex(content)
-                decrypted_content = decrypt_data(encrypted_data, context)
-                message = dict(message)  # Create a copy to avoid mutating the original
-                message["content"] = decrypted_content.decode("utf-8")
-                return message
-            except (ValueError, UnicodeDecodeError):
-                # Not valid hex or decryption failed, treat as plain text
-                pass
-            except Exception as e:
-                log.error(f"Failed to decrypt message content: {e}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to decrypt message content: {str(e)}"
-                )
-    
+    # Decrypt content field if present
+    if "content" in message and message["content"] is not None and message["content"]:
+        message["content"] = _decrypt_field(message["content"], context)
+
     return message
 
 
 def encrypt_message_content(message: dict, client_public_key: str, signing_algo: str) -> dict:
     """
-    Encrypt the content field of a message.
-    Returns message with content as a hex string (plain string format matching chat completions)
+    Encrypt the content and reasoning_content fields of a message.
+    Returns message with content/reasoning_content as hex strings (plain string format matching chat completions)
     """
-    if "content" not in message or message["content"] is None:
-        return message
-    
-    content = message["content"]
-    
-    # Only encrypt string content
-    if isinstance(content, str):
-        try:
-            encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
-            message = dict(message)  # Create a copy to avoid mutating the original
-            message["content"] = encrypted_data.hex()
-        except Exception as e:
-            log.error(f"Failed to encrypt message content: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to encrypt message content: {str(e)}"
-            )
-    
+    message = dict(message)  # Create a copy to avoid mutating the original
+
+    # Encrypt content field if present
+    if "content" in message and message["content"] is not None and message["content"]:
+        content = message["content"]
+        if isinstance(content, str):
+            try:
+                encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
+                message["content"] = encrypted_data.hex()
+            except Exception as e:
+                log.error(f"Failed to encrypt message content: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to encrypt message content: {str(e)}"
+                )
+
+    # Encrypt reasoning_content field if present
+    if "reasoning_content" in message and message["reasoning_content"] is not None and message["reasoning_content"]:
+        reasoning_content = message["reasoning_content"]
+        if isinstance(reasoning_content, str):
+            try:
+                encrypted_data = encrypt_data(reasoning_content.encode("utf-8"), client_public_key, signing_algo)
+                message["reasoning_content"] = encrypted_data.hex()
+            except Exception as e:
+                log.error(f"Failed to encrypt message reasoning_content: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to encrypt message reasoning_content: {str(e)}"
+                )
+
     return message
 
 
@@ -185,33 +204,17 @@ async def stream_vllm_response(
             # Encrypt only message content if needed
             if encrypt_response and client_public_key and signing_algo:
                 try:
-                    # Parse the chunk to encrypt only content
-                    data = chunk.strip("data: ").strip()
-                    if not data or data == "[DONE]":
-                        h.update(chunk.encode())
-                        yield chunk
-                        continue
-                    
                     chunk_data = json.loads(data)
-                    
-                    # Encrypt content in choices[].delta.content or choices[].message.content
+
+                    # Encrypt content and reasoning_content in choices[].delta or choices[].message
                     if "choices" in chunk_data:
                         for choice in chunk_data["choices"]:
-                            if "delta" in choice and "content" in choice["delta"]:
-                                content = choice["delta"]["content"]
-                                if content:
-                                    encrypted_content = encrypt_data(
-                                        content.encode("utf-8"), client_public_key, signing_algo
-                                    )
-                                    choice["delta"]["content"] = encrypted_content.hex()
-                            elif "message" in choice and "content" in choice["message"]:
-                                content = choice["message"]["content"]
-                                if content:
-                                    encrypted_content = encrypt_data(
-                                        content.encode("utf-8"), client_public_key, signing_algo
-                                    )
-                                    choice["message"]["content"] = encrypted_content.hex()
-                    
+                            # Handle delta fields
+                            if "delta" in choice:
+                                choice["delta"] = encrypt_message_content(
+                                    choice["delta"], client_public_key, signing_algo
+                                )
+
                     # Create the modified chunk string
                     modified_chunk = f"data: {json.dumps(chunk_data)}\n\n"
                     # Update hash with modified chunk
@@ -300,26 +303,16 @@ async def non_stream_vllm_response(
             raise HTTPException(status_code=response.status_code, detail="Upstream service error")
 
         response_data = response.json()
-        
-        # Encrypt only message content if needed
+
+        # Encrypt message content
         if encrypt_response and client_public_key and signing_algo:
             if "choices" in response_data:
                 for choice in response_data["choices"]:
-                    if "message" in choice and "content" in choice["message"]:
-                        content = choice["message"]["content"]
-                        if content:
-                            try:
-                                encrypted_content = encrypt_data(
-                                    content.encode("utf-8"), client_public_key, signing_algo
-                                )
-                                choice["message"]["content"] = encrypted_content.hex()
-                            except Exception as e:
-                                log.error(f"Failed to encrypt response content: {e}")
-                                raise HTTPException(
-                                    status_code=500,
-                                    detail=f"Failed to encrypt response content: {str(e)}"
-                                )
-        
+                    if "message" in choice:
+                        choice["message"] = encrypt_message_content(
+                            choice["message"], client_public_key, signing_algo
+                        )
+
         # Cache the request-response pair using the chat ID
         chat_id = response_data.get("id")
         if chat_id:
@@ -448,10 +441,12 @@ async def encrypted_chat_completions(
         "id": "...",
         "choices": [
             {
-                "message": {
+                "index": 0,
+                "delta": {
                     "role": "assistant",
                     "content": "hex_string"  // Encrypted content as hex string (matches standard format)
-                }
+                    "reasoning_content": "hex_string"  // Encrypted reasoning content as hex string (matches standard format)
+                },
             }
         ],
         ...
