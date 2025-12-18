@@ -448,6 +448,107 @@ async def test_encrypted_chat_completions_streaming_with_reasoning(respx_mock):
 
 
 @pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
+    """Test that empty string content in streaming responses is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Test"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+    
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": True,
+    }
+    
+    # Mock streaming response with empty content in one chunk
+    chat_id = "chatcmpl-empty-stream-123"
+    responses = [
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": "Hello"}, "index": 0, "finish_reason": None}
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": ""}, "index": 0, "finish_reason": None}  # Empty string
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        },
+    ]
+    
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=yield_sse_response(responses),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+    
+    # Make request
+    response = client.post(
+        "/v1/encrypted/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+    
+    # Verify response
+    assert response.status_code == 200
+    
+    # Collect streaming chunks
+    chunks = []
+    content = response.content.decode()
+    for line in content.split("\n"):
+        if line.startswith("data: "):
+            data = line.replace("data: ", "").strip()
+            if data and data != "[DONE]":
+                chunk = json.loads(data)
+                chunks.append(chunk)
+    
+    # Verify chunks
+    assert len(chunks) > 0
+    found_empty = False
+    found_encrypted = False
+    for chunk in chunks:
+        if "choices" in chunk and len(chunk["choices"]) > 0:
+            choice = chunk["choices"][0]
+            if "delta" in choice and "content" in choice["delta"]:
+                delta_content = choice["delta"]["content"]
+                if delta_content == "":
+                    found_empty = True
+                    # Empty string should remain empty, not encrypted
+                    assert delta_content == ""
+                elif delta_content:
+                    found_encrypted = True
+                    # Non-empty content should be encrypted
+                    assert isinstance(delta_content, str)
+                    assert len(delta_content) >= 64
+                    assert all(c in "0123456789abcdefABCDEF" for c in delta_content)
+    
+    assert found_empty, "Should have found empty string content"
+    assert found_encrypted, "Should have found encrypted non-empty content"
+
+
+@pytest.mark.asyncio
 async def test_encrypted_chat_completions_missing_headers():
     """Test encrypted chat completions with missing required headers."""
     request_data = {
@@ -613,4 +714,129 @@ async def test_encrypted_chat_completions_multiple_messages(respx_mock):
     response_content = response_json["choices"][0]["message"]["content"]
     assert isinstance(response_content, str)
     assert len(response_content) >= 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_empty_string_content(respx_mock):
+    """Test that empty string content is not encrypted/decrypted."""
+    # Test with empty string in request
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": ""}],  # Empty string
+        "stream": False,
+    }
+    
+    # Mock response with empty string content
+    chat_id = "chatcmpl-empty-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",  # Empty string should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+    
+    # Make request
+    response = client.post(
+        "/v1/encrypted/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+    
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+    
+    # Verify empty string in request was not decrypted (remains empty)
+    call_args = route.calls[0].request
+    sent_data = json.loads(call_args.content)
+    assert sent_data["messages"][0]["content"] == ""  # Should remain empty
+    
+    # Verify empty string in response was not encrypted (remains empty)
+    response_json = response.json()
+    response_content = response_json["choices"][0]["message"]["content"]
+    assert response_content == ""  # Should remain empty, not encrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
+    """Test that empty string reasoning_content is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Test question"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+    
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+    
+    # Mock response with empty reasoning_content
+    chat_id = "chatcmpl-empty-reasoning-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Response",
+                    "reasoning_content": "",  # Empty string should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+    
+    # Make request
+    response = client.post(
+        "/v1/encrypted/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+    
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+    
+    # Verify content is encrypted (non-empty)
+    message = response_json["choices"][0]["message"]
+    assert isinstance(message["content"], str)
+    assert len(message["content"]) >= 64  # Should be encrypted
+    
+    # Verify empty reasoning_content is NOT encrypted (remains empty)
+    assert "reasoning_content" in message
+    assert message["reasoning_content"] == ""  # Should remain empty, not encrypted
 
