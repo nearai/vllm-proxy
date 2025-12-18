@@ -37,17 +37,27 @@ def _ed25519_to_x25519_private_key_nacl(
     Convert Ed25519 private key to PyNaCl X25519 private key using PyNaCl bindings.
     
     Uses PyNaCl's built-in conversion function which handles the clamping automatically.
+    PyNaCl expects Ed25519 secret key in 64-byte format: [32-byte seed][32-byte public key]
     """
     # Get the raw private key bytes (seed) - 32 bytes
-    private_bytes = ed25519_private.private_bytes(
+    seed_bytes = ed25519_private.private_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PrivateFormat.Raw,
         encryption_algorithm=serialization.NoEncryption(),
     )
     
+    # Get the public key bytes - 32 bytes
+    public_key_bytes = ed25519_private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    
+    # PyNaCl expects Ed25519 secret key as 64 bytes: seed + public_key
+    ed25519_secret_key = seed_bytes + public_key_bytes
+    
     # Use PyNaCl's built-in conversion function
     # crypto_sign_ed25519_sk_to_curve25519 converts Ed25519 secret key to X25519 secret key
-    x25519_private_bytes = bindings.crypto_sign_ed25519_sk_to_curve25519(private_bytes)
+    x25519_private_bytes = bindings.crypto_sign_ed25519_sk_to_curve25519(ed25519_secret_key)
     
     return X25519PrivateKeyNaCl(x25519_private_bytes)
 
@@ -248,8 +258,9 @@ def _decrypt_ecdsa(encrypted_data: bytes, context: SigningContext) -> bytes:
         )
 
         # Get private key bytes from account
-        # web3 Account.key is an eth_keys.PrivateKey object
-        private_key_bytes = context._raw_account.key.to_bytes()
+        # web3 Account._key_obj is an eth_keys.PrivateKey object
+        # Account.key is a HexBytes, but _key_obj has the to_bytes() method
+        private_key_bytes = context._raw_account._key_obj.to_bytes()
 
         # Create EC private key from bytes
         private_key = ec.derive_private_key(
