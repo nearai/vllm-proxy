@@ -12,15 +12,29 @@ setup_test_environment()
 
 # Import real quote contexts BEFORE replacing with mock (needed for encryption)
 import sys
+import app.quote.quote as real_quote
 from app.encryption.encryption import encrypt_data
 
+# Store real contexts for encryption tests
+real_ecdsa_context = real_quote.ecdsa_context
+real_ed25519_context = real_quote.ed25519_context
+ECDSA = real_quote.ECDSA
+ED25519 = real_quote.ED25519
+
 # Now replace the quote module with our mock for the rest of the app
-sys.modules["app.quote.quote"] = __import__("tests.app.mock_quote", fromlist=[""])
+mock_quote_module = __import__("tests.app.mock_quote", fromlist=[""])
+sys.modules["app.quote.quote"] = mock_quote_module
+
+# Replace the mock contexts with real contexts so decryption works
+# The app code will use these contexts for decryption
+mock_quote_module.ecdsa_context = real_ecdsa_context
+mock_quote_module.ed25519_context = real_ed25519_context
+mock_quote_module.ecdsa_quote = real_ecdsa_context
+mock_quote_module.ed25519_quote = real_ed25519_context
 
 # Now we can safely import app code
 from app.main import app
 from app.api.v1.openai import VLLM_URL
-from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
 client = TestClient(app)
 
@@ -33,9 +47,9 @@ async def yield_sse_response(data_list):
 def encrypt_content(content: str, signing_algo: str) -> str:
     """Helper to encrypt content using the server's public key."""
     if signing_algo == ECDSA:
-        public_key = ecdsa_quote.signing_public_key
+        public_key = real_ecdsa_context.signing_public_key
     else:
-        public_key = ed25519_quote.signing_public_key
+        public_key = real_ed25519_context.signing_public_key
     
     encrypted_data = encrypt_data(content.encode("utf-8"), public_key, signing_algo)
     return encrypted_data.hex()
@@ -86,7 +100,7 @@ async def test_encrypted_chat_completions_non_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -158,7 +172,7 @@ async def test_encrypted_chat_completions_non_streaming_ed25519(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": ed25519_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
     
@@ -220,7 +234,7 @@ async def test_encrypted_chat_completions_with_reasoning_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -308,7 +322,7 @@ async def test_encrypted_chat_completions_streaming(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -408,7 +422,7 @@ async def test_encrypted_chat_completions_streaming_with_reasoning(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -501,7 +515,7 @@ async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -633,7 +647,7 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -688,7 +702,7 @@ async def test_encrypted_chat_completions_multiple_messages(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -752,7 +766,7 @@ async def test_encrypted_chat_completions_empty_string_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -817,7 +831,7 @@ async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": ecdsa_quote.signing_public_key,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     

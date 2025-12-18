@@ -186,9 +186,10 @@ async def stream_vllm_response(
     async def generate_stream(response):
         nonlocal chat_id, h
         async for chunk in response.aiter_text():
+            data = chunk.strip("data: ").strip()
+
             # Extract the cache key (data.id) from the first chunk
             if not chat_id:
-                data = chunk.strip("data: ").strip()
                 if not data or data == "[DONE]":
                     h.update(chunk.encode())
                     yield chunk
@@ -203,6 +204,12 @@ async def stream_vllm_response(
 
             # Encrypt only message content if needed
             if encrypt_response and client_public_key and signing_algo:
+                # Skip encryption for empty or done chunks
+                if not data or data == "[DONE]":
+                    h.update(chunk.encode())
+                    yield chunk
+                    continue
+                
                 try:
                     chunk_data = json.loads(data)
 
