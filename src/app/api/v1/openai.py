@@ -202,14 +202,16 @@ async def stream_vllm_response(
                     log.error(error_message)
                     raise Exception(error_message)
 
+            # Hash the plain chunk first (for attestation, we hash what the model processes)
+            h.update(chunk.encode())
+
             # Encrypt only message content if needed
             if encrypt_response and client_public_key and signing_algo:
                 # Skip encryption for empty or done chunks
                 if not data or data == "[DONE]":
-                    h.update(chunk.encode())
                     yield chunk
                     continue
-                
+
                 try:
                     chunk_data = json.loads(data)
 
@@ -224,17 +226,14 @@ async def stream_vllm_response(
 
                     # Create the modified chunk string
                     modified_chunk = f"data: {json.dumps(chunk_data)}\n\n"
-                    # Update hash with modified chunk
-                    h.update(modified_chunk.encode())
+                    # Yield the encrypted chunk
                     yield modified_chunk
                 except Exception as e:
                     log.error(f"Failed to encrypt chunk content: {e}")
                     # Yield error chunk
                     error_chunk = f'data: {{"error": "Encryption failed: {str(e)}"}}\n\n'
-                    h.update(error_chunk.encode())
                     yield error_chunk
             else:
-                h.update(chunk.encode())
                 yield chunk
 
         response_sha256 = h.hexdigest()
