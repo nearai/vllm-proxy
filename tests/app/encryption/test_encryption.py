@@ -1,6 +1,7 @@
 """
 Tests for encryption and decryption functionality.
 """
+
 import pytest
 from app.encryption.encryption import (
     encrypt_data,
@@ -11,6 +12,7 @@ from app.quote.quote import (
     ed25519_context,
     ECDSA,
     ED25519,
+    SigningContext,
 )
 
 
@@ -315,8 +317,6 @@ class TestCrossAlgorithm:
     def test_decrypt_with_wrong_algorithm(self):
         """Test decryption with unsupported algorithm in context."""
         # Create a context with invalid method
-        from app.quote.quote import SigningContext
-
         invalid_context = SigningContext(
             method="invalid",
             signing_address="0x123",
@@ -376,4 +376,3 @@ class TestEdgeCases:
         # Ed25519
         encrypted = encrypt_data(plaintext, ed25519_public_key, ED25519)
         assert decrypt_data(encrypted, ed25519_context) == plaintext
-
