@@ -64,14 +64,29 @@ async def global_exception_handler(request: Request, exc: Exception):
     """
     # handle HTTPException
     if isinstance(exc, HTTPException):
-        log.error(f"HTTPException: status={exc.status_code}")
-        return http_exception(exc.status_code, exc.detail)
+        log.error(f"HTTPException [{exc.status_code}]: {exc.detail}")
 
-    log.error(f"Unhandled exception: {type(exc).__name__}")
+        safe_messages = {
+            400: "Bad request",
+            401: "Unauthorized",
+            403: "Forbidden",
+            404: "Resource not found",
+            429: "Too many requests",
+            500: "Internal server error",
+        }
+        generic_message = safe_messages.get(exc.status_code, "An error occurred")
+
+        return http_exception(exc.status_code, generic_message)
+
+    log.error(
+        f"Unhandled exception [{type(exc).__name__}]: {str(exc)}\n"
+        f"Traceback (internal): {traceback.format_exc()}"
+    )
+
     return error(
         status_code=500,
-        message=str(exc),
-        type=type(exc).__name__,
+        message="Internal server error",
+        type="ServerError",
         param=None,
         code=None,
     )
