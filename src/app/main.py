@@ -1,4 +1,5 @@
 import os
+import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -61,10 +62,15 @@ async def show_version():
 async def global_exception_handler(request: Request, exc: Exception):
     """
     Handle all uncaught exceptions globally.
+
+    Note: Error logging is intentionally minimal to prevent leaking user data
+    (e.g., request payloads, prompts) that may appear in exception messages
+    or tracebacks.
     """
     # handle HTTPException
     if isinstance(exc, HTTPException):
-        log.error(f"HTTPException [{exc.status_code}]: {exc.detail}")
+        # Log only status code, not details which may contain user data
+        log.error(f"HTTPException [{exc.status_code}]")
 
         safe_messages = {
             400: "Bad request",
@@ -78,10 +84,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 
         return http_exception(exc.status_code, generic_message)
 
-    log.error(
-        f"Unhandled exception [{type(exc).__name__}]: {str(exc)}\n"
-        f"Traceback (internal): {traceback.format_exc()}"
-    )
+    # Log only exception type, not message or traceback to avoid leaking user data
+    log.error(f"Unhandled exception [{type(exc).__name__}]")
+    # Full details available at DEBUG level only for local debugging
+    log.debug(f"Exception details: {traceback.format_exc()}")
 
     return error(
         status_code=500,

@@ -47,7 +47,8 @@ class ChatCache:
             try:
                 self._redis.set_string(key, value)
             except Exception as exc:
-                log.warning("Redis write failed for %s: %s", key, exc)
+                # Log only exception type to avoid leaking user data
+                log.warning("Redis write failed: %s", type(exc).__name__)
 
     def _read_string(self, key: str) -> Optional[str]:
         """Read string from Redis first, fallback to local."""
@@ -57,7 +58,8 @@ class ChatCache:
                 if value:
                     return value
             except Exception as exc:
-                log.warning("Redis read failed for %s: %s", key, exc)
+                # Log only exception type to avoid leaking user data
+                log.warning("Redis read failed: %s", type(exc).__name__)
 
         return self._local.get(key)
 
