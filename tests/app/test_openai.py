@@ -244,7 +244,10 @@ async def test_signature_invalid_algo():
         # Verify error response
         assert response.status_code == 400
         response_data = response.json()
-        assert response_data["error"]["message"] == "Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+        assert (
+            response_data["error"]["message"]
+            == "Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+        )
         assert response_data["error"]["type"] == "invalid_signing_algo"
 
 
@@ -730,3 +733,156 @@ async def test_read_body_with_limit_rejects_large_content_length():
 
     assert exc_info.value.status_code == 413
     assert "Request body too large" in str(exc_info.value.detail)
+
+
+# ============================================================================
+# Integration Tests for Request Size Limiting via API Endpoints
+# ============================================================================
+
+
+def _create_limited_read_body(original_func, max_size: int):
+    """Create a wrapper that calls read_body_with_limit with a custom max_size."""
+
+    async def limited_read_body(request):
+        return await original_func(request, max_size=max_size)
+
+    return limited_read_body
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/chat/completions rejects requests
+    exceeding the size limit with proper 413 status code and error format.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    # Create an oversized request by including a very large message content
+    # We patch read_body_with_limit with a wrapper that uses a small limit
+    large_content = "x" * 1000  # 1000 character message
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": False,
+    }
+
+    # Patch with a wrapper that enforces a 100-byte limit
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Verify 413 Payload Too Large status code
+    assert response.status_code == 413
+
+    # Verify error response format matches OpenAI-style error structure
+    response_data = response.json()
+    assert "error" in response_data
+    assert "message" in response_data["error"]
+    assert "type" in response_data["error"]
+    # The global exception handler sanitizes the message
+    assert response_data["error"]["type"] == "http_exception"
+
+
+@pytest.mark.asyncio
+async def test_completions_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/completions rejects requests
+    exceeding the size limit with proper 413 status code and error format.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    # Create an oversized request with a large prompt
+    large_prompt = "y" * 1000  # 1000 character prompt
+    request_data = {
+        "model": "test-model",
+        "prompt": large_prompt,
+        "stream": False,
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Verify 413 Payload Too Large status code
+    assert response.status_code == 413
+
+    # Verify error response format matches OpenAI-style error structure
+    response_data = response.json()
+    assert "error" in response_data
+    assert "message" in response_data["error"]
+    assert "type" in response_data["error"]
+    assert response_data["error"]["type"] == "http_exception"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/chat/completions with streaming enabled
+    also rejects oversized requests before attempting to stream.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    large_content = "z" * 1000
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": True,  # Streaming enabled
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Size check happens before streaming starts, so we get 413
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "error" in response_data
+    assert response_data["error"]["type"] == "http_exception"
+
+
+@pytest.mark.asyncio
+async def test_tokenize_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/tokenize endpoint also enforces
+    request size limits.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    large_text = "w" * 1000
+    request_data = {
+        "model": "test-model",
+        "text": large_text,
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/tokenize",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "error" in response_data
+    assert response_data["error"]["type"] == "http_exception"
