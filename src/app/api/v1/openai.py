@@ -62,6 +62,10 @@ def _get_env_as_int(name: str, default: int) -> int:
 MAX_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_CONNECTIONS", 1000)
 MAX_KEEPALIVE_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_KEEPALIVE", 100)
 
+# Maximum request body size (default 10MB) - prevents memory exhaustion attacks
+# Critical for TEE environments with limited memory
+MAX_REQUEST_SIZE = _get_env_as_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024)
+
 _http_client: Optional[httpx.AsyncClient] = None
 
 
@@ -87,6 +91,51 @@ async def close_http_client():
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
+
+
+async def read_body_with_limit(
+    request: Request, max_size: int = MAX_REQUEST_SIZE
+) -> bytes:
+    """
+    Read request body with size limit to prevent memory exhaustion attacks.
+
+    This is critical for TEE environments where memory is limited and non-expandable.
+    The function first checks the Content-Length header for early rejection, then
+    streams the body chunk-by-chunk with running size validation.
+
+    Args:
+        request: The FastAPI Request object
+        max_size: Maximum allowed body size in bytes (default from MAX_REQUEST_SIZE)
+
+    Returns:
+        The request body as bytes
+
+    Raises:
+        HTTPException: 413 Payload Too Large if body exceeds max_size
+    """
+    # Check Content-Length header first for early rejection
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Request body too large. Maximum: {max_size} bytes",
+                )
+        except ValueError:
+            # Invalid Content-Length header, continue to stream validation
+            pass
+
+    # Stream the body with size validation
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Request body too large. Maximum: {max_size} bytes",
+            )
+    return body
 
 
 def sign_request(request: dict, response: str):
@@ -569,8 +618,8 @@ async def chat_completions(
         else None
     )
 
-    # Get the request body
-    request_body = await request.body()
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
 
     # Parse the request JSON
     try:
@@ -662,8 +711,8 @@ async def completions(
         else None
     )
 
-    # Get the request body
-    request_body = await request.body()
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
 
     # Parse the request JSON
     try:
@@ -722,8 +771,9 @@ async def completions(
 async def tokenize(request: Request):
     """
     Proxy tokenization requests to vLLM backend.
+    Uses size-limited read to prevent memory exhaustion attacks.
     """
-    request_body = await request.body()
+    request_body = await read_body_with_limit(request)
 
     client = get_http_client()
     response = await client.post(

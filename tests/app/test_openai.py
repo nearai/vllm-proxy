@@ -589,3 +589,144 @@ async def test_chat_completions_without_request_hash(respx_mock):
 
         # Verify cache was called
         mock_cache.set_chat.assert_called_once()
+
+
+# ============================================================================
+# Request Size Limiting Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_chat_completions_within_size_limit(respx_mock):
+    """Test that requests within size limit succeed normally."""
+    # Test request data (small payload - well under 10MB default limit)
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    # Mock response
+    chat_id = "chatcmpl-size-test"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hello back"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_function_rejects_large_body():
+    """Test that read_body_with_limit rejects bodies exceeding the limit."""
+    from app.api.v1.openai import read_body_with_limit
+    from fastapi import HTTPException
+
+    # Create a mock request with a large body
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            # Yield in chunks
+            chunk_size = 100
+            for i in range(0, len(self._body), chunk_size):
+                yield self._body[i : i + chunk_size]
+
+    # Test with body exceeding limit
+    large_body = b"A" * 500
+    mock_request = MockRequest(large_body)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_body_with_limit(mock_request, max_size=100)
+
+    assert exc_info.value.status_code == 413
+    assert "Request body too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_accepts_valid_body():
+    """Test that read_body_with_limit accepts bodies within the limit."""
+    from app.api.v1.openai import read_body_with_limit
+
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            yield self._body
+
+    # Test with body within limit
+    small_body = b'{"model": "test"}'
+    mock_request = MockRequest(small_body)
+
+    result = await read_body_with_limit(mock_request, max_size=1000)
+    assert result == small_body
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_rejects_large_content_length():
+    """Test that read_body_with_limit rejects based on Content-Length header."""
+    from app.api.v1.openai import read_body_with_limit
+    from fastapi import HTTPException
+
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            yield self._body
+
+    # Test with Content-Length header exceeding limit
+    small_body = b'{"model": "test"}'
+    mock_request = MockRequest(small_body, content_length="999999999")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_body_with_limit(mock_request, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "Request body too large" in str(exc_info.value.detail)
