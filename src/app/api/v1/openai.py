@@ -127,15 +127,17 @@ async def read_body_with_limit(
             pass
 
     # Stream the body with size validation
-    body = b""
+    chunks: list[bytes] = []
+    total_size = 0
     async for chunk in request.stream():
-        body += chunk
-        if len(body) > max_size:
+        total_size += len(chunk)
+        if total_size > max_size:
             raise HTTPException(
                 status_code=413,
                 detail=f"Request body too large. Maximum: {max_size} bytes",
             )
-    return body
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def sign_request(request: dict, response: str):
