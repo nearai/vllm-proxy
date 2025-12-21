@@ -149,6 +149,37 @@ def encrypt_message_content(message: dict, client_public_key: str, signing_algo:
     return message
 
 
+def decrypt_prompt(prompt, context: SigningContext):
+    """
+    Decrypt the prompt field if it's encrypted.
+    Prompt can be a string or array of strings.
+    """
+    if isinstance(prompt, str):
+        return _decrypt_field(prompt, context)
+    elif isinstance(prompt, list):
+        return [_decrypt_field(p, context) if isinstance(p, str) else p for p in prompt]
+    return prompt
+
+
+def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
+    """
+    Encrypt the text field in completions response.
+    Returns encrypted text as hex string.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    try:
+        encrypted_data = encrypt_data(text.encode("utf-8"), client_public_key, signing_algo)
+        return encrypted_data.hex()
+    except Exception as e:
+        log.error(f"Failed to encrypt text: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to encrypt text: {str(e)}"
+        )
+
+
 async def stream_vllm_response(
     url: str,
     request_body: bytes,
@@ -215,13 +246,18 @@ async def stream_vllm_response(
                 try:
                     chunk_data = json.loads(data)
 
-                    # Encrypt content and reasoning_content in choices[].delta or choices[].message
+                    # Encrypt content in choices[].delta or choices[].text (for completions)
                     if "choices" in chunk_data:
                         for choice in chunk_data["choices"]:
-                            # Handle delta fields
+                            # Handle chat completions format: delta.message.content
                             if "delta" in choice:
                                 choice["delta"] = encrypt_message_content(
                                     choice["delta"], client_public_key, signing_algo
+                                )
+                            # Handle completions format: text field
+                            elif "text" in choice and choice["text"]:
+                                choice["text"] = encrypt_text(
+                                    choice["text"], client_public_key, signing_algo
                                 )
 
                     # Create the modified chunk string
@@ -310,13 +346,19 @@ async def non_stream_vllm_response(
 
         response_data = response.json()
 
-        # Encrypt message content
+        # Encrypt response content
         if encrypt_response and client_public_key and signing_algo:
             if "choices" in response_data:
                 for choice in response_data["choices"]:
+                    # Handle chat completions format: message.content
                     if "message" in choice:
                         choice["message"] = encrypt_message_content(
                             choice["message"], client_public_key, signing_algo
+                        )
+                    # Handle completions format: text field
+                    elif "text" in choice and choice["text"]:
+                        choice["text"] = encrypt_text(
+                            choice["text"], client_public_key, signing_algo
                         )
 
         # Cache the request-response pair using the chat ID
@@ -393,13 +435,13 @@ async def chat_completions(
 ):
     """
     Chat completions endpoint with optional end-to-end encryption.
-    
+
     Supports both plain text and encrypted requests/responses.
-    
+
     Optional encryption headers (both must be provided to enable encryption):
     - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
     - X-Signing-Pub-Key: Client's public key in hex format (required if encryption is enabled)
-    
+
     When encryption is enabled:
     - Request message content should be encrypted as hex strings
     - Response message content will be encrypted as hex strings
@@ -407,7 +449,7 @@ async def chat_completions(
     """
     # Check if encryption is requested
     encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
-    
+
     if encrypt_enabled:
         # Validate signing algorithm
         if x_signing_algo not in [ECDSA, ED25519]:
@@ -415,13 +457,13 @@ async def chat_completions(
                 status_code=400,
                 detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
             )
-        
+
         # Get the signing context for decryption
         context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
-    
+
     # Get the request body
     request_body = await request.body()
-    
+
     # Parse the request JSON
     try:
         request_json = json.loads(request_body)
@@ -430,7 +472,7 @@ async def chat_completions(
             status_code=400,
             detail=f"Invalid JSON in request body: {str(e)}"
         )
-    
+
     # Decrypt message content if encryption is enabled
     if encrypt_enabled and "messages" in request_json:
         decrypted_messages = []
@@ -447,7 +489,7 @@ async def chat_completions(
                     detail=f"Failed to decrypt message content: {str(e)}"
                 )
         request_json["messages"] = decrypted_messages
-    
+
     modified_json = strip_empty_tool_calls(request_json)
 
     # Check if the request is for streaming or non-streaming
@@ -456,10 +498,10 @@ async def chat_completions(
     )  # Default to non-streaming if not specified
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
-    
+
     # Use decrypted body for hash calculation if encryption is enabled, otherwise use original
     body_for_hash = modified_request_body if encrypt_enabled else request_body
-    
+
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
@@ -490,10 +532,62 @@ async def chat_completions(
 async def completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_signing_pub_key: Optional[str] = Header(None, alias="X-Signing-Pub-Key"),
 ):
-    # Keep original request body to calculate the request hash for attestation
+    """
+    Completions endpoint with optional end-to-end encryption.
+    
+    Supports both plain text and encrypted requests/responses.
+    
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Signing-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+    
+    When encryption is enabled:
+    - Request prompt should be encrypted as hex strings
+    - Response text will be encrypted as hex strings
+    - Only prompt/text is encrypted, not the entire request/response body
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
+    
+    if encrypt_enabled:
+        # Validate signing algorithm
+        if x_signing_algo not in [ECDSA, ED25519]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
+            )
+
+        # Get the signing context for decryption
+        context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+
+    # Get the request body
     request_body = await request.body()
-    request_json = json.loads(request_body)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt prompt if encryption is enabled
+    if encrypt_enabled and "prompt" in request_json:
+        try:
+            request_json["prompt"] = decrypt_prompt(request_json["prompt"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decrypt prompt: {str(e)}"
+            )
+
     modified_json = strip_empty_tool_calls(request_json)
 
     # Check if the request is for streaming or non-streaming
@@ -502,15 +596,31 @@ async def completions(
     )  # Default to non-streaming if not specified
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
+
+    # Use decrypted body for hash calculation if encryption is enabled, otherwise use original
+    body_for_hash = modified_request_body if encrypt_enabled else request_body
+
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
-            VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
+            VLLM_COMPLETIONS_URL,
+            body_for_hash,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
         # Handle non-streaming response
         response_data = await non_stream_vllm_response(
-            VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
+            VLLM_COMPLETIONS_URL,
+            body_for_hash,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
 

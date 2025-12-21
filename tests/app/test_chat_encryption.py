@@ -35,7 +35,7 @@ mock_quote_module.ed25519_quote = real_ed25519_context
 
 # Now we can safely import app code
 from app.main import app
-from app.api.v1.openai import VLLM_URL
+from app.api.v1.openai import VLLM_URL, VLLM_COMPLETIONS_URL
 
 client = TestClient(app)
 
@@ -55,6 +55,8 @@ def encrypt_content(content: str, signing_algo: str) -> str:
     encrypted_data = encrypt_data(content.encode("utf-8"), public_key, signing_algo)
     return encrypted_data.hex()
 
+
+# ==================== Chat Completions Endpoint Tests ====================
 
 @pytest.mark.asyncio
 @pytest.mark.respx
@@ -1324,3 +1326,263 @@ async def test_signature_encrypted_streaming_ed25519(respx_mock):
     assert all(c in "0123456789abcdef" for c in signature_data["signature"].lower())
     assert len(signature_data["signature"]) == 128  # Ed25519 signature is 64 bytes = 128 hex chars
     assert signature_data["signing_address"] is not None
+
+
+# ==================== Completions Endpoint Tests ====================
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_completions_non_streaming_ecdsa(respx_mock):
+    """Test encrypted completions with ECDSA, non-streaming."""
+    # Encrypt the request prompt
+    plain_prompt = "Hello, how are you?"
+    encrypted_prompt = encrypt_content(plain_prompt, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "prompt": encrypted_prompt,
+        "stream": False,
+    }
+
+    # Mock non-streaming response data
+    completion_id = "cmpl-completion-ecdsa-123"
+    plain_response_text = "I'm doing well, thank you!"
+    response_data = {
+        "id": completion_id,
+        "object": "text_completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "text": plain_response_text,
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_COMPLETIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request with encryption headers
+    response = client.post(
+        "/v1/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+
+    # Verify text is encrypted in response
+    choice = response_json["choices"][0]
+    assert isinstance(choice["text"], str)
+    assert len(choice["text"]) >= 64  # Should be encrypted
+    assert choice["text"] != plain_response_text
+    assert all(c in "0123456789abcdefABCDEF" for c in choice["text"])
+
+    # Verify prompt was decrypted before sending to vLLM
+    call_args = route.calls[0].request
+    sent_data = json.loads(call_args.content)
+    assert sent_data["prompt"] == plain_prompt  # Should be decrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_completions_non_streaming_ed25519(respx_mock):
+    """Test encrypted completions with Ed25519, non-streaming."""
+    # Encrypt the request prompt
+    plain_prompt = "What is the weather?"
+    encrypted_prompt = encrypt_content(plain_prompt, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "prompt": encrypted_prompt,
+        "stream": False,
+    }
+
+    # Mock non-streaming response data
+    completion_id = "cmpl-completion-ed25519-123"
+    plain_response_text = "I don't have access to weather data."
+    response_data = {
+        "id": completion_id,
+        "object": "text_completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "text": plain_response_text,
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_COMPLETIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request with encryption headers
+    response = client.post(
+        "/v1/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+
+    # Verify text is encrypted in response
+    choice = response_json["choices"][0]
+    assert isinstance(choice["text"], str)
+    assert len(choice["text"]) >= 64  # Should be encrypted
+    assert choice["text"] != plain_response_text
+
+    # Verify prompt was decrypted before sending to vLLM
+    call_args = route.calls[0].request
+    sent_data = json.loads(call_args.content)
+    assert sent_data["prompt"] == plain_prompt  # Should be decrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_completions_streaming_ecdsa(respx_mock):
+    """Test encrypted completions with ECDSA, streaming."""
+    # Encrypt the request prompt
+    plain_prompt = "Tell me a story"
+    encrypted_prompt = encrypt_content(plain_prompt, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "prompt": encrypted_prompt,
+        "stream": True,
+    }
+
+    # Mock streaming response chunks
+    completion_id = "cmpl-completion-stream-ecdsa-123"
+    chunks = [
+        {"id": completion_id, "object": "text_completion", "choices": [{"text": "Once", "index": 0}]},
+        {"id": completion_id, "object": "text_completion", "choices": [{"text": " upon", "index": 0}]},
+        {"id": completion_id, "object": "text_completion", "choices": [{"text": " a time", "index": 0}]},
+        {"id": completion_id, "object": "text_completion", "choices": [{"finish_reason": "stop", "index": 0}]},
+    ]
+
+    # Setup RESPX mock for streaming
+    async def stream_generator():
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+    
+    route = respx_mock.post(VLLM_COMPLETIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=stream_generator(),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    # Make encrypted streaming completions request
+    response = client.post(
+        "/v1/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+
+    # Collect streaming chunks
+    content = response.content.decode()
+    chunks_received = []
+    for line in content.split("\n"):
+        if line.startswith("data: "):
+            data = line.replace("data: ", "").strip()
+            if data and data != "[DONE]":
+                try:
+                    chunks_received.append(json.loads(data))
+                except json.JSONDecodeError:
+                    pass
+
+    # Verify chunks are encrypted
+    assert len(chunks_received) > 0
+    for chunk in chunks_received:
+        if "choices" in chunk and len(chunk["choices"]) > 0:
+            choice = chunk["choices"][0]
+            if "text" in choice and choice["text"]:
+                # Text should be encrypted (hex string)
+                assert isinstance(choice["text"], str)
+                assert len(choice["text"]) >= 64  # Should be encrypted
+                assert all(c in "0123456789abcdefABCDEF" for c in choice["text"])
+
+    # Verify prompt was decrypted before sending to vLLM
+    call_args = route.calls[0].request
+    sent_data = json.loads(call_args.content)
+    assert sent_data["prompt"] == plain_prompt  # Should be decrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_completions_plain_request_no_encryption(respx_mock):
+    """Test that plain completions requests work without encryption headers."""
+    request_data = {
+        "model": "test-model",
+        "prompt": "Hello, world!",
+        "stream": False,
+    }
+
+    # Mock non-streaming response data
+    completion_id = "cmpl-plain-123"
+    response_data = {
+        "id": completion_id,
+        "object": "text_completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "text": "Response text",
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_COMPLETIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request without encryption headers
+    response = client.post(
+        "/v1/completions",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+
+    # Verify text is NOT encrypted (plain text)
+    choice = response_json["choices"][0]
+    assert choice["text"] == "Response text"  # Should be plain text
