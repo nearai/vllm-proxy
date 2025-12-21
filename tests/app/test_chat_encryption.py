@@ -1,4 +1,3 @@
-from unittest.mock import patch, AsyncMock
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -1001,22 +1000,33 @@ async def test_signature_encrypted_non_streaming_ecdsa(respx_mock):
     assert len(message["content"]) >= 64  # Should be encrypted
     assert message["content"] != plain_response_content
 
-    # Calculate expected hashes (Option B: hash plain/decrypted content)
-    # Request hash should be of decrypted body (what model processes)
-    # Note: json.dumps() uses default format (with spaces) to match actual code
-    decrypted_request_body = json.dumps(
-        {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": plain_content}],
-            "stream": False,
-        }
-    ).encode("utf-8")
-    expected_request_hash = sha256(decrypted_request_body).hexdigest()
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    # Note: TestClient sends JSON in compact format (no spaces), so we use separators
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
 
-    # Response hash should be of plain content (what model generates, before encryption)
-    # Note: httpx.Response serializes JSON in compact format (no spaces), so we use separators
-    plain_response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
-    expected_response_hash = sha256(plain_response_body).hexdigest()
+    # Response hash should be of encrypted response (what client receives)
+    # Manually encrypt the response content to match what the server sends
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": message["content"],  # Use the encrypted content from actual response
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    # Note: json.dumps() with separators matches the server's compact format
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
 
     # Fetch signature
     signature_response = client.get(
@@ -1089,20 +1099,35 @@ async def test_signature_encrypted_non_streaming_ed25519(respx_mock):
     response_json = response.json()
     assert response_json["id"] == chat_id
 
-    # Calculate expected hashes (Option B: hash plain/decrypted content)
-    # Note: json.dumps() uses default format (with spaces) to match actual code
-    decrypted_request_body = json.dumps(
-        {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": plain_content}],
-            "stream": False,
-        }
-    ).encode("utf-8")
-    expected_request_hash = sha256(decrypted_request_body).hexdigest()
+    # Get the encrypted content from the actual response
+    encrypted_response_content = response_json["choices"][0]["message"]["content"]
 
-    # Note: httpx.Response serializes JSON in compact format (no spaces), so we use separators
-    plain_response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
-    expected_response_hash = sha256(plain_response_body).hexdigest()
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    # Note: TestClient sends JSON in compact format (no spaces), so we use separators
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted response (what client receives)
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": encrypted_response_content,  # Use encrypted content from actual response
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    # Note: json.dumps() with separators matches the server's compact format
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
 
     # Fetch signature with explicit Ed25519 algorithm
     signature_response = client.get(
@@ -1177,38 +1202,14 @@ async def test_signature_encrypted_streaming_ecdsa(respx_mock):
     assert response.status_code == 200
     assert route.called
 
-    # Consume the stream to trigger signature caching
-    # Parse the response content manually (like other streaming tests)
-    content = response.content.decode()
-    chunks_received = []
-    for line in content.split("\n"):
-        if line.startswith("data: "):
-            data = line.replace("data: ", "").strip()
-            if data and data != "[DONE]":
-                try:
-                    chunks_received.append(json.loads(data))
-                except json.JSONDecodeError:
-                    pass
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    # Note: TestClient sends JSON in compact format (no spaces), so we use separators
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
 
-    # Calculate expected hashes (Option B: hash plain/decrypted content)
-    # Request hash should be of decrypted body
-    # Note: json.dumps() uses default format (with spaces) to match actual code
-    decrypted_request_body = json.dumps(
-        {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": plain_content}],
-            "stream": True,
-        }
-    ).encode("utf-8")
-    expected_request_hash = sha256(decrypted_request_body).hexdigest()
-
-    # Response hash should be of plain chunks (before encryption)
-    # Reconstruct the plain response stream
-    plain_chunks_text = ""
-    for chunk in chunks:
-        plain_chunks_text += f"data: {json.dumps(chunk)}\n\n"
-    plain_chunks_text += "data: [DONE]\n\n"
-    expected_response_hash = sha256(plain_chunks_text.encode()).hexdigest()
+    # Response hash should be of encrypted chunks (what client receives)
+    expected_response_hash = sha256(response.content).hexdigest()
 
     # Fetch signature
     signature_response = client.get(
@@ -1281,33 +1282,14 @@ async def test_signature_encrypted_streaming_ed25519(respx_mock):
     assert response.status_code == 200
     assert route.called
 
-    # Consume the stream to trigger signature caching
-    # Parse the response content manually (like other streaming tests)
-    content = response.content.decode()
-    for line in content.split("\n"):
-        if line.startswith("data: "):
-            data = line.replace("data: ", "").strip()
-            if data == "[DONE]":
-                break
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    # Note: TestClient sends JSON in compact format (no spaces), so we use separators
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
 
-    # Calculate expected hashes (Option B: hash plain/decrypted content)
-    # Request hash should be of decrypted body (what model processes)
-    # Note: json.dumps() uses default format (with spaces) to match actual code
-    decrypted_request_body = json.dumps(
-        {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": plain_content}],
-            "stream": True,
-        }
-    ).encode("utf-8")
-    expected_request_hash = sha256(decrypted_request_body).hexdigest()
-
-    # Response hash should be of plain chunks (before encryption)
-    plain_chunks_text = ""
-    for chunk in chunks:
-        plain_chunks_text += f"data: {json.dumps(chunk)}\n\n"
-    plain_chunks_text += "data: [DONE]\n\n"
-    expected_response_hash = sha256(plain_chunks_text.encode()).hexdigest()
+    # Response hash should be of encrypted chunks (what client receives)
+    expected_response_hash = sha256(response.content).hexdigest()
 
     # Fetch signature with explicit Ed25519 algorithm
     signature_response = client.get(

@@ -92,7 +92,7 @@ def decrypt_data(encrypted_data: bytes, context: SigningContext) -> bytes:
     Decrypt data using the signing context's private key.
 
     Args:
-        encrypted_data: Encrypted data (format: [nonce (12 bytes)][encrypted_data])
+        encrypted_data: Encrypted data
         context: SigningContext with private key
 
     Returns:

@@ -270,13 +270,11 @@ async def stream_vllm_response(
                         log.error(error_message)
                         raise Exception(error_message)
 
-                # Hash the plain chunk first (for attestation, we hash what the model processes)
-                h.update(chunk.encode())
-
                 # Encrypt only message content if needed
                 if encrypt_response and client_public_key and signing_algo:
                     # Skip encryption for empty or done chunks
                     if not data or data == "[DONE]":
+                        h.update(chunk.encode())
                         yield chunk
                         continue
 
@@ -299,14 +297,19 @@ async def stream_vllm_response(
 
                         # Create the modified chunk string
                         modified_chunk = f"data: {json.dumps(chunk_data)}\n\n"
+                        # Hash the encrypted chunk (what client receives)
+                        h.update(modified_chunk.encode())
                         # Yield the encrypted chunk
                         yield modified_chunk
                     except Exception as e:
                         log.error(f"Failed to encrypt chunk content: {e}")
                         # Yield error chunk
                         error_chunk = f'data: {{"error": "Encryption failed: {str(e)}"}}\n\n'
+                        h.update(error_chunk.encode())
                         yield error_chunk
                 else:
+                    # Hash and yield plain chunk
+                    h.update(chunk.encode())
                     yield chunk
 
             response_sha256 = h.hexdigest()
@@ -321,7 +324,7 @@ async def stream_vllm_response(
                 raise Exception(error_message)
         finally:
             await response.aclose()
-    
+
     client = get_http_client()
 
     # Forward the request to the vllm backend
@@ -402,7 +405,10 @@ async def non_stream_vllm_response(
     # Cache the request-response pair using the chat ID
     chat_id = response_data.get("id")
     if chat_id:
-        response_sha256 = sha256(response.content).hexdigest()
+        # Hash the encrypted response (what client receives) for easier verification
+        # Serialize the encrypted response_data to bytes for hashing
+        encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
+        response_sha256 = sha256(encrypted_response_body).hexdigest()
         cache.set_chat(
             chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
         )
@@ -539,14 +545,11 @@ async def chat_completions(
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
 
-    # Use decrypted body for hash calculation if encryption is enabled, otherwise use original
-    body_for_hash = modified_request_body if encrypt_enabled else request_body
-
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
             VLLM_URL,
-            body_for_hash,
+            request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
@@ -557,7 +560,7 @@ async def chat_completions(
         # Handle non-streaming response
         response_data = await non_stream_vllm_response(
             VLLM_URL,
-            body_for_hash,
+            request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
@@ -637,14 +640,11 @@ async def completions(
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
 
-    # Use decrypted body for hash calculation if encryption is enabled, otherwise use original
-    body_for_hash = modified_request_body if encrypt_enabled else request_body
-
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
             VLLM_COMPLETIONS_URL,
-            body_for_hash,
+            request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
@@ -655,7 +655,7 @@ async def completions(
         # Handle non-streaming response
         response_data = await non_stream_vllm_response(
             VLLM_COMPLETIONS_URL,
-            body_for_hash,
+            request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
