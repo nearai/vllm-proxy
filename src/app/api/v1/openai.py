@@ -122,9 +122,6 @@ def _decrypt_field(field_value: str, context: SigningContext) -> str:
             encrypted_data = bytes.fromhex(field_value)
             decrypted_content = decrypt_data(encrypted_data, context)
             return decrypted_content.decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
-            # Not valid hex or decryption failed, treat as plain text
-            pass
         except Exception as e:
             log.error(f"Failed to decrypt field: {e}")
             raise HTTPException(
@@ -137,12 +134,12 @@ def _decrypt_field(field_value: str, context: SigningContext) -> str:
 
 def decrypt_message_content(message: dict, context: SigningContext) -> dict:
     """
-    Decrypt the content and reasoning_content fields of a message if they're encrypted.
-    Expected format: {"content": "hex_string"} (encrypted) or {"content": "plain_text"} (unencrypted)
-    If content/reasoning_content is a valid hex string, it will be treated as encrypted and decrypted.
+    Decrypt the content field of a message if it's encrypted.
+    Expected format: {"content": "hex_string"} (encrypted)
+    If content is a valid hex string, it will be treated as encrypted and decrypted.
     """
     message = dict(message)  # Create a copy to avoid mutating the original
-    
+
     # Decrypt content field if present
     if "content" in message and message["content"] is not None and message["content"]:
         message["content"] = _decrypt_field(message["content"], context)
