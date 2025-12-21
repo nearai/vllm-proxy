@@ -549,9 +549,7 @@ async def chat_completions(
     encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
 
     # Validate encryption headers and get signing context if encryption is enabled
-    context = None
-    if encrypt_enabled:
-        context = validate_encryption_headers(x_signing_algo, x_client_pub_key)
+    context = validate_encryption_headers(x_signing_algo, x_client_pub_key) if encrypt_enabled else None
 
     # Get the request body
     request_body = await request.body()
@@ -642,9 +640,7 @@ async def completions(
     encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
     
     # Validate encryption headers and get signing context if encryption is enabled
-    context = None
-    if encrypt_enabled:
-        context = validate_encryption_headers(x_signing_algo, x_client_pub_key)
+    context = validate_encryption_headers(x_signing_algo, x_client_pub_key) if encrypt_enabled else None
 
     # Get the request body
     request_body = await request.body()
