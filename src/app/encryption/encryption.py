@@ -5,16 +5,10 @@ For ECDSA: Uses ECIES (Elliptic Curve Integrated Encryption Scheme)
 For Ed25519: Uses PyNaCl Box (X25519 key exchange + ChaCha20-Poly1305 encryption)
 """
 
-import json
 import os
-from typing import Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
@@ -25,8 +19,6 @@ from app.quote.quote import (
     SigningContext,
     ECDSA,
     ED25519,
-    ecdsa_context,
-    ed25519_context,
 )
 
 
@@ -193,10 +185,6 @@ def _encrypt_ecdsa(data: bytes, public_key_hex: str) -> bytes:
             raise ValueError(
                 f"ECDSA public key must be 64 bytes (or 65 with 0x04), got {len(public_key_bytes)}"
             )
-
-        # Reconstruct public key
-        x = int.from_bytes(public_key_bytes[:32], "big")
-        y = int.from_bytes(public_key_bytes[32:], "big")
 
         # Create EC public key
         public_key = ec.EllipticCurvePublicKey.from_encoded_point(
