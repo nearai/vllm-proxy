@@ -102,7 +102,7 @@ async def test_encrypted_chat_completions_non_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -174,7 +174,7 @@ async def test_encrypted_chat_completions_non_streaming_ed25519(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -236,7 +236,7 @@ async def test_encrypted_chat_completions_with_reasoning_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -325,7 +325,7 @@ async def test_encrypted_chat_completions_streaming(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -427,7 +427,7 @@ async def test_encrypted_chat_completions_streaming_with_reasoning(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -525,7 +525,7 @@ async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -603,7 +603,7 @@ async def test_encrypted_chat_completions_partial_headers(respx_mock):
         json=request_data,
         headers={
             "Authorization": TEST_AUTH_HEADER,
-            "X-Signing-Pub-Key": "some-key",
+            "X-Client-Pub-Key": "some-key",
         },
     )
     assert response.status_code == 200
@@ -612,7 +612,7 @@ async def test_encrypted_chat_completions_partial_headers(respx_mock):
     response_json = response.json()
     assert response_json["choices"][0]["message"]["content"] == "Response"
 
-    # Missing X-Signing-Pub-Key - should work as plain request
+    # Missing X-Client-Pub-Key - should work as plain request
     response = client.post(
         "/v1/chat/completions",
         json=request_data,
@@ -643,7 +643,7 @@ async def test_encrypted_chat_completions_invalid_algo():
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": "invalid-algo",
-            "X-Signing-Pub-Key": "some-key",
+            "X-Client-Pub-Key": "some-key",
         },
     )
 
@@ -690,7 +690,7 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
     
@@ -796,7 +796,7 @@ async def test_encrypted_chat_completions_multiple_messages(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -860,7 +860,7 @@ async def test_encrypted_chat_completions_empty_string_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -925,7 +925,7 @@ async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -989,7 +989,7 @@ async def test_encrypted_chat_completions_null_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1049,7 +1049,7 @@ async def test_encrypted_chat_completions_null_reasoning_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -1114,7 +1114,7 @@ async def test_encrypted_chat_completions_empty_and_null_fields(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1189,7 +1189,7 @@ async def test_encrypted_chat_completions_streaming_null_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1298,7 +1298,7 @@ async def test_encrypted_chat_completions_streaming_null_reasoning_content(respx
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -1376,7 +1376,7 @@ async def test_signature_encrypted_non_streaming_empty_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1477,7 +1477,7 @@ async def test_signature_encrypted_non_streaming_null_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -1581,7 +1581,7 @@ async def test_signature_encrypted_non_streaming_empty_reasoning_content(respx_m
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1686,7 +1686,7 @@ async def test_signature_encrypted_non_streaming_null_reasoning_content(respx_mo
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -1810,7 +1810,7 @@ async def test_signature_encrypted_streaming_empty_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -1907,7 +1907,7 @@ async def test_signature_encrypted_streaming_null_content(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -1986,7 +1986,7 @@ async def test_signature_encrypted_non_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -2092,7 +2092,7 @@ async def test_signature_encrypted_non_streaming_ed25519(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -2197,7 +2197,7 @@ async def test_signature_encrypted_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -2277,7 +2277,7 @@ async def test_signature_encrypted_streaming_ed25519(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -2358,7 +2358,7 @@ async def test_encrypted_completions_non_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 
@@ -2423,7 +2423,7 @@ async def test_encrypted_completions_non_streaming_ed25519(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ED25519,
-            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+            "X-Client-Pub-Key": real_ed25519_context.signing_public_key,
         },
     )
 
@@ -2488,7 +2488,7 @@ async def test_encrypted_completions_streaming_ecdsa(respx_mock):
         headers={
             "Authorization": TEST_AUTH_HEADER,
             "X-Signing-Algo": ECDSA,
-            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
         },
     )
 

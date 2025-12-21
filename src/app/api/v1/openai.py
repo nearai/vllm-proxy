@@ -107,14 +107,14 @@ def sign_chat(text: str):
 
 
 def validate_encryption_headers(
-    x_signing_algo: Optional[str], x_signing_pub_key: Optional[str]
+    x_signing_algo: Optional[str], x_client_pub_key: Optional[str]
 ) -> SigningContext:
     """
     Validate encryption headers and return the signing context for decryption.
     
     Args:
         x_signing_algo: Signing algorithm ('ecdsa' or 'ed25519')
-        x_signing_pub_key: Public key in hex format
+        x_client_pub_key: Client's public key in hex format
         
     Returns:
         SigningContext for the specified algorithm
@@ -130,19 +130,19 @@ def validate_encryption_headers(
         )
 
     # Validate public key format and length
-    if not x_signing_pub_key:
+    if not x_client_pub_key:
         raise HTTPException(
             status_code=400,
-            detail="X-Signing-Pub-Key cannot be empty"
+            detail="X-Client-Pub-Key cannot be empty"
         )
 
     # Check if it's a valid hex string
     try:
-        public_key_bytes = bytes.fromhex(x_signing_pub_key)
+        public_key_bytes = bytes.fromhex(x_client_pub_key)
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="X-Signing-Pub-Key must be a valid hex string"
+            detail="X-Client-Pub-Key must be a valid hex string"
         )
 
     # Validate length based on algorithm
@@ -151,7 +151,7 @@ def validate_encryption_headers(
         if len(public_key_bytes) != 32:
             raise HTTPException(
                 status_code=400,
-                detail=f"Ed25519 public key must be 64 hex characters (32 bytes), got {len(x_signing_pub_key)} characters"
+                detail=f"Ed25519 public key must be 64 hex characters (32 bytes), got {len(x_client_pub_key)} characters"
             )
     elif x_signing_algo == ECDSA:
         # ECDSA: 64 bytes (128 hex chars) or 65 bytes with 0x04 prefix (130 hex chars)
@@ -164,7 +164,7 @@ def validate_encryption_headers(
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"ECDSA public key must be 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix), got {len(x_signing_pub_key)} characters"
+                detail=f"ECDSA public key must be 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix), got {len(x_client_pub_key)} characters"
             )
 
     # Get and return the signing context for decryption
@@ -529,7 +529,7 @@ async def chat_completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
     x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
-    x_signing_pub_key: Optional[str] = Header(None, alias="X-Signing-Pub-Key"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
 ):
     """
     Chat completions endpoint with optional end-to-end encryption.
@@ -538,7 +538,7 @@ async def chat_completions(
 
     Optional encryption headers (both must be provided to enable encryption):
     - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
-    - X-Signing-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
 
     When encryption is enabled:
     - Request message content should be encrypted as hex strings
@@ -546,12 +546,12 @@ async def chat_completions(
     - Only message content is encrypted, not the entire request/response body
     """
     # Check if encryption is requested
-    encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
 
     # Validate encryption headers and get signing context if encryption is enabled
     context = None
     if encrypt_enabled:
-        context = validate_encryption_headers(x_signing_algo, x_signing_pub_key)
+        context = validate_encryption_headers(x_signing_algo, x_client_pub_key)
 
     # Get the request body
     request_body = await request.body()
@@ -599,7 +599,7 @@ async def chat_completions(
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
-            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
@@ -610,7 +610,7 @@ async def chat_completions(
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
-            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
@@ -622,7 +622,7 @@ async def completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
     x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
-    x_signing_pub_key: Optional[str] = Header(None, alias="X-Signing-Pub-Key"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
 ):
     """
     Completions endpoint with optional end-to-end encryption.
@@ -631,7 +631,7 @@ async def completions(
     
     Optional encryption headers (both must be provided to enable encryption):
     - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
-    - X-Signing-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
     
     When encryption is enabled:
     - Request prompt should be encrypted as hex strings
@@ -639,12 +639,12 @@ async def completions(
     - Only prompt/text is encrypted, not the entire request/response body
     """
     # Check if encryption is requested
-    encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
     
     # Validate encryption headers and get signing context if encryption is enabled
     context = None
     if encrypt_enabled:
-        context = validate_encryption_headers(x_signing_algo, x_signing_pub_key)
+        context = validate_encryption_headers(x_signing_algo, x_client_pub_key)
 
     # Get the request body
     request_body = await request.body()
@@ -688,7 +688,7 @@ async def completions(
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
-            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
@@ -699,7 +699,7 @@ async def completions(
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
-            client_public_key=x_signing_pub_key if encrypt_enabled else None,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
