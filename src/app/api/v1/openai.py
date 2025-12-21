@@ -106,6 +106,71 @@ def sign_chat(text: str):
     )
 
 
+def validate_encryption_headers(
+    x_signing_algo: Optional[str], x_signing_pub_key: Optional[str]
+) -> SigningContext:
+    """
+    Validate encryption headers and return the signing context for decryption.
+    
+    Args:
+        x_signing_algo: Signing algorithm ('ecdsa' or 'ed25519')
+        x_signing_pub_key: Public key in hex format
+        
+    Returns:
+        SigningContext for the specified algorithm
+        
+    Raises:
+        HTTPException: If validation fails (invalid algorithm, invalid key format, etc.)
+    """
+    # Validate signing algorithm
+    if x_signing_algo not in [ECDSA, ED25519]:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid X-Signing-Algo. Must be "{ECDSA}" or "{ED25519}"'
+        )
+
+    # Validate public key format and length
+    if not x_signing_pub_key:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Signing-Pub-Key cannot be empty"
+        )
+
+    # Check if it's a valid hex string
+    try:
+        public_key_bytes = bytes.fromhex(x_signing_pub_key)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Signing-Pub-Key must be a valid hex string"
+        )
+
+    # Validate length based on algorithm
+    if x_signing_algo == ED25519:
+        # Ed25519: 32 bytes = 64 hex characters
+        if len(public_key_bytes) != 32:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Ed25519 public key must be 64 hex characters (32 bytes), got {len(x_signing_pub_key)} characters"
+            )
+    elif x_signing_algo == ECDSA:
+        # ECDSA: 64 bytes (128 hex chars) or 65 bytes with 0x04 prefix (130 hex chars)
+        if len(public_key_bytes) == 65 and public_key_bytes[0] == 0x04:
+            # Uncompressed format with 0x04 prefix - valid
+            pass
+        elif len(public_key_bytes) == 64:
+            # Uncompressed format without 0x04 prefix - valid
+            pass
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ECDSA public key must be 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix), got {len(x_signing_pub_key)} characters"
+            )
+
+    # Get and return the signing context for decryption
+    return ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+
+
 def _decrypt_field(field_value: str, context: SigningContext) -> str:
     """
     Decrypt a field value if it's encrypted (hex string).
@@ -154,33 +219,20 @@ def encrypt_message_content(message: dict, client_public_key: str, signing_algo:
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
-    # Encrypt content field if present
-    if "content" in message and message["content"] is not None and message["content"]:
-        content = message["content"]
-        if isinstance(content, str):
-            try:
-                encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
-                message["content"] = encrypted_data.hex()
-            except Exception as e:
-                log.error(f"Failed to encrypt message content: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to encrypt message content: {str(e)}"
-                )
-
-    # Encrypt reasoning_content field if present
-    if "reasoning_content" in message and message["reasoning_content"] is not None and message["reasoning_content"]:
-        reasoning_content = message["reasoning_content"]
-        if isinstance(reasoning_content, str):
-            try:
-                encrypted_data = encrypt_data(reasoning_content.encode("utf-8"), client_public_key, signing_algo)
-                message["reasoning_content"] = encrypted_data.hex()
-            except Exception as e:
-                log.error(f"Failed to encrypt message reasoning_content: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to encrypt message reasoning_content: {str(e)}"
-                )
+    # Encrypt content and reasoning_content fields if present
+    for field in ["content", "reasoning_content"]:
+        if field in message and message[field] is not None and message[field]:
+            content = message[field]
+            if isinstance(content, str):
+                try:
+                    encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
+                    message[field] = encrypted_data.hex()
+                except Exception as e:
+                    log.error(f"Failed to encrypt message {field}: {e}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to encrypt message {field}: {str(e)}"
+                    )
 
     return message
 
@@ -285,12 +337,12 @@ async def stream_vllm_response(
                         if "choices" in chunk_data:
                             for choice in chunk_data["choices"]:
                                 # Handle chat completions format: delta.message.content
-                                if "delta" in choice:
+                                if "delta" in choice and choice["delta"] is not None and choice["delta"]:
                                     choice["delta"] = encrypt_message_content(
                                         choice["delta"], client_public_key, signing_algo
                                     )
                                 # Handle completions format: text field
-                                elif "text" in choice and choice["text"]:
+                                elif "text" in choice and choice["text"] is not None and choice["text"]:
                                     choice["text"] = encrypt_text(
                                         choice["text"], client_public_key, signing_algo
                                     )
@@ -392,12 +444,12 @@ async def non_stream_vllm_response(
         if "choices" in response_data:
             for choice in response_data["choices"]:
                 # Handle chat completions format: message.content
-                if "message" in choice:
+                if "message" in choice and choice["message"] is not None and choice["message"]:
                     choice["message"] = encrypt_message_content(
                         choice["message"], client_public_key, signing_algo
                     )
                 # Handle completions format: text field
-                elif "text" in choice and choice["text"]:
+                elif "text" in choice and choice["text"] is not None and choice["text"]:
                     choice["text"] = encrypt_text(
                         choice["text"], client_public_key, signing_algo
                     )
@@ -496,16 +548,10 @@ async def chat_completions(
     # Check if encryption is requested
     encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
 
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = None
     if encrypt_enabled:
-        # Validate signing algorithm
-        if x_signing_algo not in [ECDSA, ED25519]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
-            )
-
-        # Get the signing context for decryption
-        context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+        context = validate_encryption_headers(x_signing_algo, x_signing_pub_key)
 
     # Get the request body
     request_body = await request.body()
@@ -595,16 +641,10 @@ async def completions(
     # Check if encryption is requested
     encrypt_enabled = x_signing_algo is not None and x_signing_pub_key is not None
     
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = None
     if encrypt_enabled:
-        # Validate signing algorithm
-        if x_signing_algo not in [ECDSA, ED25519]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid X-Signing-Algo. Must be '{ECDSA}' or '{ED25519}'"
-            )
-
-        # Get the signing context for decryption
-        context = ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+        context = validate_encryption_headers(x_signing_algo, x_signing_pub_key)
 
     # Get the request body
     request_body = await request.body()

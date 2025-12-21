@@ -77,7 +77,7 @@ def encrypt_data(data: bytes, public_key_hex: str, signing_algo: str) -> bytes:
         signing_algo: Either 'ecdsa' or 'ed25519'
 
     Returns:
-        Encrypted data as bytes (format: [nonce (12 bytes)][encrypted_data])
+        Encrypted data as bytes
     """
     if signing_algo == ED25519:
         return _encrypt_ed25519(data, public_key_hex)

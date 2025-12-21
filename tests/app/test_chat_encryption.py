@@ -1500,10 +1500,7 @@ async def test_encrypted_completions_streaming_ecdsa(respx_mock):
         if line.startswith("data: "):
             data = line.replace("data: ", "").strip()
             if data and data != "[DONE]":
-                try:
-                    chunks_received.append(json.loads(data))
-                except json.JSONDecodeError:
-                    pass
+                chunks_received.append(json.loads(data))
 
     # Verify chunks are encrypted
     assert len(chunks_received) > 0
