@@ -242,6 +242,7 @@ async def test_encrypted_chat_completions_with_reasoning_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
 
     # Verify both content and reasoning_content are encrypted
@@ -432,6 +433,7 @@ async def test_encrypted_chat_completions_streaming_with_reasoning(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
 
     # Collect streaming chunks
     chunks = []
@@ -529,6 +531,7 @@ async def test_encrypted_chat_completions_streaming_empty_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
 
     # Collect streaming chunks
     chunks = []
@@ -619,6 +622,7 @@ async def test_encrypted_chat_completions_partial_headers(respx_mock):
         },
     )
     assert response.status_code == 200
+    assert route.called
     # Response should be plain text (not encrypted)
     response_json = response.json()
     assert response_json["choices"][0]["message"]["content"] == "Response"
@@ -927,6 +931,7 @@ async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
 
     # Verify content is encrypted (non-empty)
@@ -990,6 +995,7 @@ async def test_encrypted_chat_completions_null_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
 
     # Verify null content is NOT encrypted (remains null)
@@ -1049,6 +1055,7 @@ async def test_encrypted_chat_completions_null_reasoning_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
 
     # Verify content is encrypted (non-empty)
@@ -1113,6 +1120,7 @@ async def test_encrypted_chat_completions_empty_and_null_fields(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
 
     # Verify both fields are NOT encrypted
@@ -1296,6 +1304,7 @@ async def test_encrypted_chat_completions_streaming_null_reasoning_content(respx
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
 
     # Collect streaming chunks
     chunks = []
@@ -1373,6 +1382,7 @@ async def test_signature_encrypted_non_streaming_empty_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
@@ -1473,6 +1483,7 @@ async def test_signature_encrypted_non_streaming_null_content(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
@@ -1576,6 +1587,7 @@ async def test_signature_encrypted_non_streaming_empty_reasoning_content(respx_m
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
@@ -1680,6 +1692,7 @@ async def test_signature_encrypted_non_streaming_null_reasoning_content(respx_mo
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
@@ -1979,6 +1992,7 @@ async def test_signature_encrypted_non_streaming_ecdsa(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
@@ -2084,6 +2098,7 @@ async def test_signature_encrypted_non_streaming_ed25519(respx_mock):
 
     # Verify response
     assert response.status_code == 200
+    assert route.called
     response_json = response.json()
     assert response_json["id"] == chat_id
 
