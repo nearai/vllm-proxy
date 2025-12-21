@@ -941,6 +941,994 @@ async def test_encrypted_chat_completions_empty_reasoning_content(respx_mock):
 
 @pytest.mark.asyncio
 @pytest.mark.respx
+async def test_encrypted_chat_completions_null_content(respx_mock):
+    """Test that null content in response is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Test question"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock response with null content
+    chat_id = "chatcmpl-null-content-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,  # Null should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+
+    # Verify null content is NOT encrypted (remains null)
+    message = response_json["choices"][0]["message"]
+    assert message["content"] is None  # Should remain null, not encrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_null_reasoning_content(respx_mock):
+    """Test that null reasoning_content in response is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Test question"
+    encrypted_content = encrypt_content(plain_content, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock response with null reasoning_content
+    chat_id = "chatcmpl-null-reasoning-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Response",
+                    "reasoning_content": None,  # Null should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+
+    # Verify content is encrypted (non-empty)
+    message = response_json["choices"][0]["message"]
+    assert isinstance(message["content"], str)
+    assert len(message["content"]) >= 64  # Should be encrypted
+
+    # Verify null reasoning_content is NOT encrypted (remains null)
+    assert "reasoning_content" in message
+    assert message["reasoning_content"] is None  # Should remain null, not encrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_empty_and_null_fields(respx_mock):
+    """Test that both empty and null fields in response are handled correctly."""
+    # Encrypt the request content
+    plain_content = "Test question"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock response with both empty and null fields
+    chat_id = "chatcmpl-empty-null-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",  # Empty string should not be encrypted
+                    "reasoning_content": None,  # Null should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+
+    # Verify both fields are NOT encrypted
+    message = response_json["choices"][0]["message"]
+    assert message["content"] == ""  # Should remain empty, not encrypted
+    assert message["reasoning_content"] is None  # Should remain null, not encrypted
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_streaming_null_content(respx_mock):
+    """Test that null content in streaming responses is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Test"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": True,
+    }
+
+    # Mock streaming response with null content in one chunk
+    chat_id = "chatcmpl-stream-null-123"
+    responses = [
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": "Hello"}, "index": 0, "finish_reason": None}
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": None}, "index": 0, "finish_reason": None}  # Null content
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        },
+    ]
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=yield_sse_response(responses),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    # Make request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+
+    # Collect streaming chunks
+    chunks = []
+    content = response.content.decode()
+    for line in content.split("\n"):
+        if line.startswith("data: "):
+            data = line.replace("data: ", "").strip()
+            if data and data != "[DONE]":
+                chunk = json.loads(data)
+                chunks.append(chunk)
+
+    # Verify chunks
+    assert len(chunks) > 0
+    found_null = False
+    found_encrypted = False
+    for chunk in chunks:
+        if "choices" in chunk and len(chunk["choices"]) > 0:
+            choice = chunk["choices"][0]
+            if "delta" in choice and "content" in choice["delta"]:
+                delta_content = choice["delta"]["content"]
+                if delta_content is None:
+                    found_null = True
+                    # Null should remain null, not encrypted
+                    assert delta_content is None
+                elif delta_content:
+                    found_encrypted = True
+                    # Non-empty content should be encrypted
+                    assert isinstance(delta_content, str)
+                    assert len(delta_content) >= 64
+                    assert all(c in "0123456789abcdefABCDEF" for c in delta_content)
+
+    assert found_null, "Should have found null content"
+    assert found_encrypted, "Should have found encrypted non-empty content"
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_chat_completions_streaming_null_reasoning_content(respx_mock):
+    """Test that null reasoning_content in streaming responses is not encrypted."""
+    # Encrypt the request content
+    plain_content = "Think step by step"
+    encrypted_content = encrypt_content(plain_content, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": True,
+    }
+
+    # Mock streaming response with null reasoning_content
+    chat_id = "chatcmpl-stream-null-reasoning-123"
+    responses = [
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": None,  # Null should not be encrypted
+                    },
+                    "index": 0,
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": "Answer"}, "index": 0, "finish_reason": None}
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        },
+    ]
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=yield_sse_response(responses),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    # Make request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+
+    # Collect streaming chunks
+    chunks = []
+    content = response.content.decode()
+    for line in content.split("\n"):
+        if line.startswith("data: "):
+            data = line.replace("data: ", "").strip()
+            if data and data != "[DONE]":
+                chunk = json.loads(data)
+                chunks.append(chunk)
+
+    # Verify reasoning_content is null (not encrypted)
+    found_null_reasoning = False
+    for chunk in chunks:
+        if "choices" in chunk and len(chunk["choices"]) > 0:
+            choice = chunk["choices"][0]
+            if "delta" in choice and "reasoning_content" in choice["delta"]:
+                reasoning = choice["delta"]["reasoning_content"]
+                if reasoning is None:
+                    found_null_reasoning = True
+                    # Null should remain null, not encrypted
+                    assert reasoning is None
+
+    assert found_null_reasoning, "Should have found null reasoning_content"
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_non_streaming_empty_content(respx_mock):
+    """Test signature endpoint with empty content in response."""
+    # Encrypt the request content
+    plain_content = "Hello"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock non-streaming response data with empty content
+    chat_id = "chatcmpl-signature-empty-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",  # Empty string should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make encrypted chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["id"] == chat_id
+
+    # Verify content is empty (not encrypted)
+    message = response_json["choices"][0]["message"]
+    assert message["content"] == ""  # Should remain empty, not encrypted
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted response (what client receives)
+    # Empty content should remain empty in the response
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",  # Empty string remains empty
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
+
+    # Fetch signature
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ECDSA
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert signature_data["signature"].startswith("0x")
+    assert len(signature_data["signature"]) > 0
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_non_streaming_null_content(respx_mock):
+    """Test signature endpoint with null content in response."""
+    # Encrypt the request content
+    plain_content = "Hello"
+    encrypted_content = encrypt_content(plain_content, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock non-streaming response data with null content
+    chat_id = "chatcmpl-signature-null-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,  # Null should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make encrypted chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["id"] == chat_id
+
+    # Verify content is null (not encrypted)
+    message = response_json["choices"][0]["message"]
+    assert message["content"] is None  # Should remain null, not encrypted
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted response (what client receives)
+    # Null content should remain null in the response
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,  # Null remains null
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
+
+    # Fetch signature with explicit Ed25519 algorithm
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}?signing_algo={ED25519}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ED25519
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert len(signature_data["signature"]) > 0
+    assert all(c in "0123456789abcdef" for c in signature_data["signature"].lower())
+    assert len(signature_data["signature"]) == 128
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_non_streaming_empty_reasoning_content(respx_mock):
+    """Test signature endpoint with empty reasoning_content in response."""
+    # Encrypt the request content
+    plain_content = "Think step by step"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock non-streaming response data with empty reasoning_content
+    chat_id = "chatcmpl-signature-empty-reasoning-123"
+    plain_response_content = "Answer"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": plain_response_content,
+                    "reasoning_content": "",  # Empty string should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make encrypted chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["id"] == chat_id
+
+    # Verify content is encrypted but reasoning_content is empty
+    message = response_json["choices"][0]["message"]
+    assert isinstance(message["content"], str)
+    assert len(message["content"]) >= 64  # Should be encrypted
+    assert message["reasoning_content"] == ""  # Should remain empty
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted response (what client receives)
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": message["content"],  # Use encrypted content from actual response
+                    "reasoning_content": "",  # Empty remains empty
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
+
+    # Fetch signature
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ECDSA
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert signature_data["signature"].startswith("0x")
+    assert len(signature_data["signature"]) > 0
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_non_streaming_null_reasoning_content(respx_mock):
+    """Test signature endpoint with null reasoning_content in response."""
+    # Encrypt the request content
+    plain_content = "Think step by step"
+    encrypted_content = encrypt_content(plain_content, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    # Mock non-streaming response data with null reasoning_content
+    chat_id = "chatcmpl-signature-null-reasoning-123"
+    plain_response_content = "Answer"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": plain_response_content,
+                    "reasoning_content": None,  # Null should not be encrypted
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Make encrypted chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["id"] == chat_id
+
+    # Verify content is encrypted but reasoning_content is null
+    message = response_json["choices"][0]["message"]
+    assert isinstance(message["content"], str)
+    assert len(message["content"]) >= 64  # Should be encrypted
+    assert message["reasoning_content"] is None  # Should remain null
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted response (what client receives)
+    encrypted_response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": message["content"],  # Use encrypted content from actual response
+                    "reasoning_content": None,  # Null remains null
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    encrypted_response_body = json.dumps(encrypted_response_data, separators=(",", ":")).encode("utf-8")
+    expected_response_hash = sha256(encrypted_response_body).hexdigest()
+
+    # Fetch signature with explicit Ed25519 algorithm
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}?signing_algo={ED25519}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ED25519
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert len(signature_data["signature"]) > 0
+    assert all(c in "0123456789abcdef" for c in signature_data["signature"].lower())
+    assert len(signature_data["signature"]) == 128
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_streaming_empty_content(respx_mock):
+    """Test signature endpoint with empty content in streaming response."""
+    # Encrypt the request content
+    plain_content = "Test"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": True,
+    }
+
+    # Mock streaming response chunks with empty content
+    chat_id = "chatcmpl-signature-stream-empty-123"
+    chunks = [
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": "Hello"}, "index": 0, "finish_reason": None}
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": ""}, "index": 0, "finish_reason": None}  # Empty content
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        },
+    ]
+
+    # Setup RESPX mock for streaming
+    async def stream_generator():
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=stream_generator(),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    # Make encrypted streaming chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Signing-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted chunks (what client receives)
+    expected_response_hash = sha256(response.content).hexdigest()
+
+    # Fetch signature
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ECDSA
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert signature_data["signature"].startswith("0x")
+    assert len(signature_data["signature"]) > 0
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_signature_encrypted_streaming_null_content(respx_mock):
+    """Test signature endpoint with null content in streaming response."""
+    # Encrypt the request content
+    plain_content = "Test"
+    encrypted_content = encrypt_content(plain_content, ED25519)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": True,
+    }
+
+    # Mock streaming response chunks with null content
+    chat_id = "chatcmpl-signature-stream-null-123"
+    chunks = [
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": "Hello"}, "index": 0, "finish_reason": None}
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [
+                {"delta": {"content": None}, "index": 0, "finish_reason": None}  # Null content
+            ],
+        },
+        {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": 1677825464,
+            "model": "test-model",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        },
+    ]
+
+    # Setup RESPX mock for streaming
+    async def stream_generator():
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=stream_generator(),
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    # Make encrypted streaming chat completion request
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ED25519,
+            "X-Signing-Pub-Key": real_ed25519_context.signing_public_key,
+        },
+    )
+
+    # Verify response
+    assert response.status_code == 200
+    assert route.called
+
+    # Calculate expected hashes (Option A: hash encrypted request/response bodies)
+    # Request hash should be of original encrypted request body (what client sends)
+    encrypted_request_body = json.dumps(request_data, separators=(",", ":")).encode("utf-8")
+    expected_request_hash = sha256(encrypted_request_body).hexdigest()
+
+    # Response hash should be of encrypted chunks (what client receives)
+    expected_response_hash = sha256(response.content).hexdigest()
+
+    # Fetch signature with explicit Ed25519 algorithm
+    signature_response = client.get(
+        f"/v1/signature/{chat_id}?signing_algo={ED25519}",
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify signature response
+    assert signature_response.status_code == 200
+    signature_data = signature_response.json()
+    assert signature_data["signing_algo"] == ED25519
+    assert signature_data["text"] == f"{expected_request_hash}:{expected_response_hash}"
+    assert len(signature_data["signature"]) > 0
+    assert all(c in "0123456789abcdef" for c in signature_data["signature"].lower())
+    assert len(signature_data["signature"]) == 128
+    assert signature_data["signing_address"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
 async def test_signature_encrypted_non_streaming_ecdsa(respx_mock):
     """Test signature endpoint after encrypted non-streaming chat completion with ECDSA."""
     # Encrypt the request content
