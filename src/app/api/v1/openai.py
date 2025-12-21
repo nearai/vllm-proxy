@@ -179,22 +179,17 @@ def _decrypt_field(field_value: str, context: SigningContext) -> str:
     if not isinstance(field_value, str) or len(field_value) == 0:
         return field_value
 
-    # Check if it's a valid hex string (even length, hex characters only)
-    # Encrypted data is typically longer, so we check for minimum length
-    if len(field_value) >= 64 and len(field_value) % 2 == 0 and all(c in '0123456789abcdefABCDEF' for c in field_value):
-        try:
-            # Try to decode as hex and decrypt
-            encrypted_data = bytes.fromhex(field_value)
-            decrypted_content = decrypt_data(encrypted_data, context)
-            return decrypted_content.decode("utf-8")
-        except Exception as e:
-            log.error(f"Failed to decrypt field: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to decrypt field: {str(e)}"
-            )
-
-    return field_value
+    try:
+        # Try to decode as hex and decrypt
+        encrypted_data = bytes.fromhex(field_value)
+        decrypted_content = decrypt_data(encrypted_data, context)
+        return decrypted_content.decode("utf-8")
+    except Exception as e:
+        log.error(f"Failed to decrypt field: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to decrypt field: {str(e)}"
+        )
 
 
 def decrypt_message_content(message: dict, context: SigningContext) -> dict:

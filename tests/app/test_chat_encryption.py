@@ -655,35 +655,19 @@ async def test_encrypted_chat_completions_invalid_algo():
 @pytest.mark.asyncio
 @pytest.mark.respx
 async def test_encrypted_chat_completions_plain_text_content(respx_mock):
-    """Test that plain text content (not encrypted) is passed through when encryption headers are provided."""
-    # Use plain text content (not encrypted hex string)
+    """Test that content must be encrypted when encryption headers are provided."""
+    # Encrypt the content since encryption headers are provided
+    plain_content = "This is plain text, not encrypted"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+    
     request_data = {
         "model": "test-model",
-        "messages": [{"role": "user", "content": "This is plain text, not encrypted"}],
+        "messages": [{"role": "user", "content": plain_content}],
         "stream": False,
     }
     
-    # Mock response
-    chat_id = "chatcmpl-plain-123"
-    response_data = {
-        "id": chat_id,
-        "object": "chat.completion",
-        "created": 1677825464,
-        "model": "test-model",
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "Response"},
-                "index": 0,
-                "finish_reason": "stop",
-            }
-        ],
-    }
-    
-    # Setup RESPX mock
-    route = respx_mock.post(VLLM_URL).mock(
-        return_value=httpx.Response(200, json=response_data)
-    )
-    
+    # Don't set up route mock since decryption will fail before HTTP request is made
+    # Make request with plain text content (should fail decryption)
     response = client.post(
         "/v1/chat/completions",
         json=request_data,
@@ -694,14 +678,9 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
         },
     )
     
-    # Should succeed - plain text is treated as plain text (not decrypted, but response will be encrypted)
-    assert response.status_code == 200
-    assert route.called
-    # Response should be encrypted since encryption headers were provided
-    response_json = response.json()
-    response_content = response_json["choices"][0]["message"]["content"]
-    assert isinstance(response_content, str)
-    assert len(response_content) >= 64  # Should be encrypted
+    # Should fail - content is not encrypted
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Failed to decrypt field: non-hexadecimal number found in fromhex() arg at position 0"
 
 
 @pytest.mark.asyncio
@@ -754,16 +733,17 @@ async def test_chat_completions_plain_request_no_encryption(respx_mock):
 @pytest.mark.respx
 async def test_encrypted_chat_completions_multiple_messages(respx_mock):
     """Test encrypted chat completions with multiple messages."""
-    # Encrypt multiple messages
+    # Encrypt all messages since encryption headers are provided
     encrypted_content1 = encrypt_content("Hello", ECDSA)
-    encrypted_content2 = encrypt_content("How are you?", ECDSA)
+    encrypted_content2 = encrypt_content("Hi there!", ECDSA)
+    encrypted_content3 = encrypt_content("How are you?", ECDSA)
 
     request_data = {
         "model": "test-model",
         "messages": [
             {"role": "user", "content": encrypted_content1},
-            {"role": "assistant", "content": "Hi there!"},
-            {"role": "user", "content": encrypted_content2},
+            {"role": "assistant", "content": encrypted_content2},
+            {"role": "user", "content": encrypted_content3},
         ],
         "stream": False,
     }
@@ -808,7 +788,7 @@ async def test_encrypted_chat_completions_multiple_messages(respx_mock):
     call_args = route.calls[0].request
     sent_data = json.loads(call_args.content)
     assert sent_data["messages"][0]["content"] == "Hello"
-    assert sent_data["messages"][1]["content"] == "Hi there!"  # Plain text unchanged
+    assert sent_data["messages"][1]["content"] == "Hi there!"  # Should be decrypted
     assert sent_data["messages"][2]["content"] == "How are you?"
 
     # Verify response is encrypted
