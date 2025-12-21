@@ -215,7 +215,7 @@ def decrypt_message_content(message: dict, context: SigningContext) -> dict:
 def encrypt_message_content(message: dict, client_public_key: str, signing_algo: str) -> dict:
     """
     Encrypt the content and reasoning_content fields of a message.
-    Returns message with content/reasoning_content as hex strings (plain string format matching chat completions)
+    Returns message with encrypted content/reasoning_content as hex strings.
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
@@ -354,11 +354,9 @@ async def stream_vllm_response(
                         # Yield the encrypted chunk
                         yield modified_chunk
                     except Exception as e:
-                        log.error(f"Failed to encrypt chunk content: {e}")
-                        # Yield error chunk
-                        error_chunk = f'data: {{"error": "Encryption failed: {str(e)}"}}\n\n'
-                        h.update(error_chunk.encode())
-                        yield error_chunk
+                        error_message = f"Failed to encrypt chunk content: {type(e).__name__}: {e}"
+                        log.error(error_message)
+                        raise Exception(error_message)
                 else:
                     # Hash and yield plain chunk
                     h.update(chunk.encode())
