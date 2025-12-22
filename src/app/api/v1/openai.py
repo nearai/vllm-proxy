@@ -185,10 +185,10 @@ def _decrypt_field(field_value: str, context: SigningContext) -> str:
         decrypted_content = decrypt_data(encrypted_data, context)
         return decrypted_content.decode("utf-8")
     except Exception as e:
-        log.error(f"Failed to decrypt field: {e}")
+        log.error(f"Failed to decrypt field: {type(e).__name__}")
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to decrypt field: {str(e)}"
+            detail="Failed to decrypt field"
         )
 
 
@@ -209,13 +209,13 @@ def decrypt_message_content(message: dict, context: SigningContext) -> dict:
 
 def encrypt_message_content(message: dict, client_public_key: str, signing_algo: str) -> dict:
     """
-    Encrypt the content and reasoning_content fields of a message.
-    Returns message with encrypted content/reasoning_content as hex strings.
+    Encrypt the content and reasoning content fields of a message.
+    Returns message with encrypted content and reasoning content as hex strings.
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
-    # Encrypt content and reasoning_content fields if present
-    for field in ["content", "reasoning_content"]:
+    # Encrypt content and reasoning content fields if present
+    for field in ["content", "reasoning_content", "reasoning"]:
         if field in message and message[field] is not None and message[field]:
             content = message[field]
             if isinstance(content, str):
@@ -223,10 +223,10 @@ def encrypt_message_content(message: dict, client_public_key: str, signing_algo:
                     encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
                     message[field] = encrypted_data.hex()
                 except Exception as e:
-                    log.error(f"Failed to encrypt message {field}: {e}")
+                    log.error(f"Failed to encrypt message {field}: {type(e).__name__}")
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to encrypt message {field}: {str(e)}"
+                        detail=f"Failed to encrypt message {field}"
                     )
 
     return message
@@ -256,10 +256,10 @@ def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
         encrypted_data = encrypt_data(text.encode("utf-8"), client_public_key, signing_algo)
         return encrypted_data.hex()
     except Exception as e:
-        log.error(f"Failed to encrypt text: {e}")
+        log.error(f"Failed to encrypt text: {type(e).__name__}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to encrypt text: {str(e)}"
+            detail="Failed to encrypt text"
         )
 
 
@@ -349,7 +349,7 @@ async def stream_vllm_response(
                         # Yield the encrypted chunk
                         yield modified_chunk
                     except Exception as e:
-                        error_message = f"Failed to encrypt chunk content: {type(e).__name__}: {e}"
+                        error_message = f"Failed to encrypt chunk content: {type(e).__name__}"
                         log.error(error_message)
                         raise Exception(error_message)
                 else:
@@ -566,10 +566,10 @@ async def chat_completions(
             except HTTPException:
                 raise
             except Exception as e:
-                log.error(f"Failed to decrypt message content: {e}")
+                log.error(f"Failed to decrypt message content: {type(e).__name__}")
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Failed to decrypt message content: {str(e)}"
+                    detail="Failed to decrypt message content"
                 )
         request_json["messages"] = decrypted_messages
 
@@ -654,10 +654,10 @@ async def completions(
         except HTTPException:
             raise
         except Exception as e:
-            log.error(f"Failed to decrypt prompt: {e}")
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Failed to decrypt prompt: {str(e)}"
+                detail="Failed to decrypt prompt"
             )
 
     modified_json = strip_empty_tool_calls(request_json)

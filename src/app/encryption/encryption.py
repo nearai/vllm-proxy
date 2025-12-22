@@ -135,7 +135,7 @@ def _encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
         ephemeral_public_bytes = bytes(ephemeral_public)
         return ephemeral_public_bytes + encrypted
     except Exception as e:
-        log.error(f"Ed25519 encryption failed: {e}")
+        log.error(f"Ed25519 encryption failed: {type(e).__name__}")
         raise
 
 
@@ -168,7 +168,7 @@ def _decrypt_ed25519(encrypted_data: bytes, context: SigningContext) -> bytes:
 
         return plaintext
     except Exception as e:
-        log.error(f"Ed25519 decryption failed: {e}")
+        log.error(f"Ed25519 decryption failed: {type(e).__name__}")
         raise
 
 
@@ -220,7 +220,7 @@ def _encrypt_ecdsa(data: bytes, public_key_hex: str) -> bytes:
         )
         return ephemeral_public_bytes + nonce + ciphertext
     except Exception as e:
-        log.error(f"ECDSA encryption failed: {e}")
+        log.error(f"ECDSA encryption failed: {type(e).__name__}")
         raise
 
 
@@ -274,5 +274,5 @@ def _decrypt_ecdsa(encrypted_data: bytes, context: SigningContext) -> bytes:
 
         return plaintext
     except Exception as e:
-        log.error(f"ECDSA decryption failed: {e}")
+        log.error(f"ECDSA decryption failed: {type(e).__name__}")
         raise
