@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dstack_sdk import DstackClient
 from eth_account.messages import encode_defunct
-from eth_keys.datatypes import PrivateKey as EthPrivateKey
+from eth_keys.datatypes import PrivateKey as EcdsaPrivateKey
 from nv_attestation_sdk import attestation
 from verifier import cc_admin
 from app.logger import log
@@ -47,7 +47,7 @@ class SigningContext:
             raise ValueError("Ed25519 context not properly initialized")
         return self._ed_private
 
-    def get_ecdsa_private_key(self) -> EthPrivateKey:
+    def get_ecdsa_private_key(self) -> EcdsaPrivateKey:
         if self.method != ECDSA:
             raise ValueError("Context is not configured for ECDSA")
         if self._raw_account is None:
