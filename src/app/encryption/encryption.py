@@ -146,8 +146,8 @@ def _decrypt_ed25519(encrypted_data: bytes, context: SigningContext) -> bytes:
             raise ValueError("Ed25519 context not properly initialized")
 
         # Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
-        # Minimum: 32 (ephemeral public) + 24 (nonce) + 0 (empty ciphertext) = 56 bytes
-        if len(encrypted_data) < 56:
+        # Minimum: 32 (ephemeral public) + 24 (nonce) + 16 (Poly1305 auth tag) = 72 bytes
+        if len(encrypted_data) < 72:
             raise ValueError("Encrypted data too short")
 
         # Extract components
@@ -230,9 +230,9 @@ def _decrypt_ecdsa(encrypted_data: bytes, context: SigningContext) -> bytes:
         if context._raw_account is None:
             raise ValueError("ECDSA context not properly initialized")
 
-        if (
-            len(encrypted_data) < 77
-        ):  # 65 (ephemeral public) + 12 (nonce) + at least some ciphertext
+        # Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext]
+        # Minimum: 65 (ephemeral public) + 12 (nonce) + 16 (AES-GCM auth tag) = 93 bytes
+        if len(encrypted_data) < 93:
             raise ValueError("Encrypted data too short")
 
         # Extract components
