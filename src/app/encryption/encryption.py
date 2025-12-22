@@ -142,9 +142,6 @@ def _encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
 def _decrypt_ed25519(encrypted_data: bytes, context: SigningContext) -> bytes:
     """Decrypt data using Ed25519 private key via PyNaCl Box."""
     try:
-        if context._ed_private is None:
-            raise ValueError("Ed25519 context not properly initialized")
-
         # Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
         # Minimum: 32 (ephemeral public) + 24 (nonce) + 16 (Poly1305 auth tag) = 72 bytes
         if len(encrypted_data) < 72:
@@ -154,8 +151,9 @@ def _decrypt_ed25519(encrypted_data: bytes, context: SigningContext) -> bytes:
         ephemeral_public_bytes = encrypted_data[:32]
         box_encrypted = encrypted_data[32:]  # Contains [nonce (24 bytes)][ciphertext]
 
-        # Convert Ed25519 private to X25519 private (PyNaCl format)
-        x25519_private = _ed25519_to_x25519_private_key_nacl(context._ed_private)
+        # Get Ed25519 private key and convert to X25519 private (PyNaCl format)
+        ed25519_private = context.get_ed25519_private_key()
+        x25519_private = _ed25519_to_x25519_private_key_nacl(ed25519_private)
 
         # Convert ephemeral public key to X25519 (PyNaCl format)
         ephemeral_public = X25519PublicKeyNaCl(ephemeral_public_bytes)
@@ -227,9 +225,6 @@ def _encrypt_ecdsa(data: bytes, public_key_hex: str) -> bytes:
 def _decrypt_ecdsa(encrypted_data: bytes, context: SigningContext) -> bytes:
     """Decrypt data using ECDSA private key."""
     try:
-        if context._raw_account is None:
-            raise ValueError("ECDSA context not properly initialized")
-
         # Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext]
         # Minimum: 65 (ephemeral public) + 12 (nonce) + 16 (AES-GCM auth tag) = 93 bytes
         if len(encrypted_data) < 93:
@@ -245,12 +240,8 @@ def _decrypt_ecdsa(encrypted_data: bytes, context: SigningContext) -> bytes:
             ec.SECP256K1(), ephemeral_public_bytes
         )
 
-        # Get private key bytes from account
-        # web3 Account._key_obj is an eth_keys.PrivateKey object
-        # Account.key is a HexBytes, but _key_obj has the to_bytes() method
-        private_key_bytes = context._raw_account._key_obj.to_bytes()
-
-        # Create EC private key from bytes
+        # Get ECDSA private key bytes and create EC private key
+        private_key_bytes = context.get_ecdsa_private_key().to_bytes()
         private_key = ec.derive_private_key(
             int.from_bytes(private_key_bytes, "big"), ec.SECP256K1(), default_backend()
         )

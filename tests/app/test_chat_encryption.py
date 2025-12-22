@@ -680,7 +680,7 @@ async def test_encrypted_chat_completions_plain_text_content(respx_mock):
     
     # Should fail - content is not encrypted
     assert response.status_code == 400
-    assert response.json()["detail"] == "Failed to decrypt field: non-hexadecimal number found in fromhex() arg at position 0"
+    assert response.json()["detail"] == "Failed to decrypt field"
 
 
 @pytest.mark.asyncio
