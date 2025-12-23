@@ -23,10 +23,15 @@ from app.logger import log
 from app.quote.quote import (
     ECDSA,
     ED25519,
+    SigningContext,
     ecdsa_context,
     ed25519_context,
     generate_attestation,
     sign_message,
+)
+from app.encryption.encryption import (
+    encrypt_data,
+    decrypt_data,
 )
 
 router = APIRouter(tags=["openai"])
@@ -101,22 +106,186 @@ def sign_chat(text: str):
     )
 
 
+def validate_encryption_headers(
+    x_signing_algo: Optional[str], x_client_pub_key: Optional[str]
+) -> SigningContext:
+    """
+    Validate encryption headers and return the signing context for decryption.
+    
+    Args:
+        x_signing_algo: Signing algorithm ('ecdsa' or 'ed25519')
+        x_client_pub_key: Client's public key in hex format
+        
+    Returns:
+        SigningContext for the specified algorithm
+        
+    Raises:
+        HTTPException: If validation fails (invalid algorithm, invalid key format, etc.)
+    """
+    # Validate signing algorithm
+    if x_signing_algo not in [ECDSA, ED25519]:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid X-Signing-Algo. Must be "{ECDSA}" or "{ED25519}"'
+        )
+
+    # Validate public key format and length
+    if not x_client_pub_key:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Client-Pub-Key cannot be empty"
+        )
+
+    # Check if it's a valid hex string
+    try:
+        public_key_bytes = bytes.fromhex(x_client_pub_key)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Client-Pub-Key must be a valid hex string"
+        )
+
+    # Validate length based on algorithm
+    if x_signing_algo == ED25519:
+        # Ed25519: 32 bytes = 64 hex characters
+        if len(public_key_bytes) != 32:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Ed25519 public key must be 64 hex characters (32 bytes), got {len(x_client_pub_key)} characters"
+            )
+    elif x_signing_algo == ECDSA:
+        # ECDSA: 64 bytes (128 hex chars) or 65 bytes with 0x04 prefix (130 hex chars)
+        if len(public_key_bytes) == 65 and public_key_bytes[0] == 0x04:
+            # Uncompressed format with 0x04 prefix - valid
+            pass
+        elif len(public_key_bytes) == 64:
+            # Uncompressed format without 0x04 prefix - valid
+            pass
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ECDSA public key must be 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix), got {len(x_client_pub_key)} characters"
+            )
+
+    # Get and return the signing context for decryption
+    return ecdsa_context if x_signing_algo == ECDSA else ed25519_context
+
+
+def _decrypt_field(field_value: str, context: SigningContext) -> str:
+    """
+    Decrypt a field value if it's encrypted (hex string).
+    Returns decrypted value or raise an exception if decryption fails.
+    """
+    if len(field_value) == 0:
+        return field_value
+
+    try:
+        # Try to decode as hex and decrypt
+        encrypted_data = bytes.fromhex(field_value)
+        decrypted_content = decrypt_data(encrypted_data, context)
+        return decrypted_content.decode("utf-8")
+    except Exception as e:
+        log.error(f"Failed to decrypt field: {type(e).__name__}")
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to decrypt field"
+        )
+
+
+def decrypt_message_content(message: dict, context: SigningContext) -> dict:
+    """
+    Decrypt the content field of a message if it's encrypted.
+    Expected format: {"content": "hex_string"} (encrypted)
+    If content is a valid hex string, it will be treated as encrypted and decrypted.
+    """
+    message = dict(message)  # Create a copy to avoid mutating the original
+
+    # Decrypt content field if present and is a string
+    if "content" in message and message["content"] is not None and isinstance(message["content"], str) and message["content"]:
+        message["content"] = _decrypt_field(message["content"], context)
+
+    return message
+
+
+def encrypt_message_content(message: dict, client_public_key: str, signing_algo: str) -> dict:
+    """
+    Encrypt the content and reasoning content fields of a message.
+    Returns message with encrypted content and reasoning content as hex strings.
+    """
+    message = dict(message)  # Create a copy to avoid mutating the original
+
+    # Encrypt content and reasoning content fields if present
+    for field in ["content", "reasoning_content", "reasoning"]:
+        if field in message and message[field] is not None and message[field]:
+            content = message[field]
+            if isinstance(content, str):
+                try:
+                    encrypted_data = encrypt_data(content.encode("utf-8"), client_public_key, signing_algo)
+                    message[field] = encrypted_data.hex()
+                except Exception as e:
+                    log.error(f"Failed to encrypt message {field}: {type(e).__name__}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to encrypt message {field}"
+                    )
+
+    return message
+
+
+def decrypt_prompt(prompt, context: SigningContext):
+    """
+    Decrypt the prompt field if it's encrypted.
+    Prompt can be a string or array of strings.
+    """
+    if isinstance(prompt, str):
+        return _decrypt_field(prompt, context)
+    elif isinstance(prompt, list):
+        return [_decrypt_field(p, context) if isinstance(p, str) else p for p in prompt]
+    return prompt
+
+
+def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
+    """
+    Encrypt the text field in completions response.
+    Returns encrypted text as hex string.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    try:
+        encrypted_data = encrypt_data(text.encode("utf-8"), client_public_key, signing_algo)
+        return encrypted_data.hex()
+    except Exception as e:
+        log.error(f"Failed to encrypt text: {type(e).__name__}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to encrypt text"
+        )
+
+
 async def stream_vllm_response(
     url: str,
     request_body: bytes,
     modified_request_body: bytes,
     request_hash: Optional[str] = None,
+    encrypt_response: bool = False,
+    client_public_key: Optional[str] = None,
+    signing_algo: Optional[str] = None,
 ):
     """
     Handle streaming vllm request
     Args:
+        url: The vllm backend URL
         request_body: The original request body
         modified_request_body: The modified enhanced request body
         request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
                      pre-calculated request hash, avoiding redundant hash computation. Falls back to
                      calculating hash from request_body if not provided
+        encrypt_response: Whether to encrypt the response chunks
+        client_public_key: Client's public key for encryption (required if encrypt_response=True)
+        signing_algo: Signing algorithm for encryption (required if encrypt_response=True)
     Returns:
-        A streaming response
+        A streaming response (encrypted if encrypt_response=True)
     """
     if request_hash:
         request_sha256 = request_hash
@@ -132,30 +301,67 @@ async def stream_vllm_response(
         nonlocal chat_id, h
         try:
             async for chunk in response.aiter_text():
-                h.update(chunk.encode())
+                data = chunk.strip("data: ").strip()
+
                 # Extract the cache key (data.id) from the first chunk
                 if not chat_id:
-                    data = chunk.strip("data: ").strip()
                     if not data or data == "[DONE]":
+                        h.update(chunk.encode())
+                        yield chunk
                         continue
                     try:
                         chunk_data = json.loads(data)
                         chat_id = chunk_data.get("id")
                     except Exception as e:
-                        error_message = (
-                            f"Failed to parse the first chunk: {type(e).__name__}: {e}"
-                        )
+                        error_message = f"Failed to parse the first chunk: {type(e).__name__}"
                         log.error(error_message)
                         raise Exception(error_message)
 
-                yield chunk
+                # Encrypt only message content if needed
+                if encrypt_response and client_public_key and signing_algo:
+                    # Skip encryption for empty or done chunks
+                    if not data or data == "[DONE]":
+                        h.update(chunk.encode())
+                        yield chunk
+                        continue
+
+                    try:
+                        chunk_data = json.loads(data)
+
+                        # Encrypt content in choices[].delta or choices[].text (for completions)
+                        if "choices" in chunk_data:
+                            for choice in chunk_data["choices"]:
+                                # Handle chat completions format: delta.message.content
+                                if "delta" in choice and choice["delta"] is not None and choice["delta"]:
+                                    choice["delta"] = encrypt_message_content(
+                                        choice["delta"], client_public_key, signing_algo
+                                    )
+                                # Handle completions format: text field
+                                elif "text" in choice and choice["text"] is not None and choice["text"]:
+                                    choice["text"] = encrypt_text(
+                                        choice["text"], client_public_key, signing_algo
+                                    )
+
+                        # Create the modified chunk string
+                        modified_chunk = f"data: {json.dumps(chunk_data)}\n\n"
+                        # Hash the encrypted chunk (what client receives)
+                        h.update(modified_chunk.encode())
+                        # Yield the encrypted chunk
+                        yield modified_chunk
+                    except Exception as e:
+                        error_message = f"Failed to encrypt chunk content: {type(e).__name__}"
+                        log.error(error_message)
+                        raise Exception(error_message)
+                else:
+                    # Hash and yield plain chunk
+                    h.update(chunk.encode())
+                    yield chunk
 
             response_sha256 = h.hexdigest()
             # Cache the full request and response using the extracted cache key
             if chat_id:
                 cache.set_chat(
-                    chat_id,
-                    json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+                    chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
                 )
             else:
                 error_message = "Chat id could not be extracted from the response"
@@ -165,6 +371,7 @@ async def stream_vllm_response(
             await response.aclose()
 
     client = get_http_client()
+
     # Forward the request to the vllm backend
     req = client.build_request("POST", url, content=modified_request_body)
     response = await client.send(req, stream=True)
@@ -191,6 +398,9 @@ async def non_stream_vllm_response(
     request_body: bytes,
     modified_request_body: bytes,
     request_hash: Optional[str] = None,
+    encrypt_response: bool = False,
+    client_public_key: Optional[str] = None,
+    signing_algo: Optional[str] = None,
 ):
     """
     Handle non-streaming responses
@@ -200,8 +410,11 @@ async def non_stream_vllm_response(
         request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
                      pre-calculated request hash, avoiding redundant hash computation. Falls back to
                      calculating hash from request_body if not provided
+        encrypt_response: Whether to encrypt the response content
+        client_public_key: Client's public key for encryption (required if encrypt_response=True)
+        signing_algo: Signing algorithm for encryption (required if encrypt_response=True)
     Returns:
-        The response data
+        The response data (with encrypted content if encrypt_response=True)
     """
     if request_hash:
         request_sha256 = request_hash
@@ -218,10 +431,29 @@ async def non_stream_vllm_response(
         )
 
     response_data = response.json()
+
+    # Encrypt response content
+    if encrypt_response and client_public_key and signing_algo:
+        if "choices" in response_data:
+            for choice in response_data["choices"]:
+                # Handle chat completions format: message.content
+                if "message" in choice and choice["message"] is not None and choice["message"]:
+                    choice["message"] = encrypt_message_content(
+                        choice["message"], client_public_key, signing_algo
+                    )
+                # Handle completions format: text field
+                elif "text" in choice and choice["text"] is not None and choice["text"]:
+                    choice["text"] = encrypt_text(
+                        choice["text"], client_public_key, signing_algo
+                    )
+
     # Cache the request-response pair using the chat ID
     chat_id = response_data.get("id")
     if chat_id:
-        response_sha256 = sha256(response.content).hexdigest()
+        # Hash the encrypted response (what client receives) for easier verification
+        # Serialize the encrypted response_data to bytes for hashing
+        encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
+        response_sha256 = sha256(encrypted_response_body).hexdigest()
         cache.set_chat(
             chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
         )
@@ -289,10 +521,58 @@ async def attestation_report(
 async def chat_completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
 ):
-    # Keep original request body to calculate the request hash for attestation
+    """
+    Chat completions endpoint with optional end-to-end encryption.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request message content should be encrypted as hex strings
+    - Response message content will be encrypted as hex strings
+    - Only message content is encrypted, not the entire request/response body
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = validate_encryption_headers(x_signing_algo, x_client_pub_key) if encrypt_enabled else None
+
+    # Get the request body
     request_body = await request.body()
-    request_json = json.loads(request_body)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt message content if encryption is enabled
+    if encrypt_enabled and "messages" in request_json:
+        decrypted_messages = []
+        for message in request_json["messages"]:
+            try:
+                decrypted_message = decrypt_message_content(message, context)
+                decrypted_messages.append(decrypted_message)
+            except HTTPException:
+                raise
+            except Exception as e:
+                log.error(f"Failed to decrypt message content: {type(e).__name__}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Failed to decrypt message content"
+                )
+        request_json["messages"] = decrypted_messages
+
     modified_json = strip_empty_tool_calls(request_json)
 
     # Check if the request is for streaming or non-streaming
@@ -301,15 +581,28 @@ async def chat_completions(
     )  # Default to non-streaming if not specified
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
+
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
-            VLLM_URL, request_body, modified_request_body, x_request_hash
+            VLLM_URL,
+            request_body,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
         # Handle non-streaming response
         response_data = await non_stream_vllm_response(
-            VLLM_URL, request_body, modified_request_body, x_request_hash
+            VLLM_URL,
+            request_body,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
 
@@ -319,10 +612,54 @@ async def chat_completions(
 async def completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
 ):
-    # Keep original request body to calculate the request hash for attestation
+    """
+    Completions endpoint with optional end-to-end encryption.
+    
+    Supports both plain text and encrypted requests/responses.
+    
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+    
+    When encryption is enabled:
+    - Request prompt should be encrypted as hex strings
+    - Response text will be encrypted as hex strings
+    - Only prompt/text is encrypted, not the entire request/response body
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+    
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = validate_encryption_headers(x_signing_algo, x_client_pub_key) if encrypt_enabled else None
+
+    # Get the request body
     request_body = await request.body()
-    request_json = json.loads(request_body)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt prompt if encryption is enabled
+    if encrypt_enabled and "prompt" in request_json:
+        try:
+            request_json["prompt"] = decrypt_prompt(request_json["prompt"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to decrypt prompt"
+            )
+
     modified_json = strip_empty_tool_calls(request_json)
 
     # Check if the request is for streaming or non-streaming
@@ -331,15 +668,28 @@ async def completions(
     )  # Default to non-streaming if not specified
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
+
     if is_stream:
         # Create a streaming response
         return await stream_vllm_response(
-            VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
+            VLLM_COMPLETIONS_URL,
+            request_body,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
     else:
         # Handle non-streaming response
         response_data = await non_stream_vllm_response(
-            VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
+            VLLM_COMPLETIONS_URL,
+            request_body,
+            modified_request_body,
+            x_request_hash,
+            encrypt_response=encrypt_enabled,
+            client_public_key=x_client_pub_key if encrypt_enabled else None,
+            signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
 
