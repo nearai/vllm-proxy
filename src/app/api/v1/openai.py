@@ -174,9 +174,9 @@ def validate_encryption_headers(
 def _decrypt_field(field_value: str, context: SigningContext) -> str:
     """
     Decrypt a field value if it's encrypted (hex string).
-    Returns decrypted value or original value if not encrypted.
+    Returns decrypted value or raise an exception if decryption fails.
     """
-    if not isinstance(field_value, str) or len(field_value) == 0:
+    if len(field_value) == 0:
         return field_value
 
     try:
@@ -200,8 +200,8 @@ def decrypt_message_content(message: dict, context: SigningContext) -> dict:
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
-    # Decrypt content field if present
-    if "content" in message and message["content"] is not None and message["content"]:
+    # Decrypt content field if present and is a string
+    if "content" in message and message["content"] is not None and isinstance(message["content"], str) and message["content"]:
         message["content"] = _decrypt_field(message["content"], context)
 
     return message
@@ -313,7 +313,7 @@ async def stream_vllm_response(
                         chunk_data = json.loads(data)
                         chat_id = chunk_data.get("id")
                     except Exception as e:
-                        error_message = f"Failed to parse the first chunk: {type(e).__name__}: {e}"
+                        error_message = f"Failed to parse the first chunk: {type(e).__name__}"
                         log.error(error_message)
                         raise Exception(error_message)
 
