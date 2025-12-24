@@ -5,8 +5,8 @@ Tools for validating Phala Cloud attestation and response signatures.
 ## Requirements
 
 - Python 3.10+
-- `requests`, `eth-account`
-- Phala Cloud API key from https://redpill.ai (for signature verifier only)
+- `requests`, `eth-account`, `cryptography`, `pynacl`
+- Phala Cloud API key from https://redpill.ai (for signature verifier and encryption verifier)
 
 ## Attestation Verifier
 
@@ -146,3 +146,116 @@ When `/v1/attestation/report?signing_address={addr}&nonce={nonce}`:
 ```
 
 The verifier filters `all_attestations` to find the entry matching the signature's `signing_address`.
+
+## Encryption Verifier
+
+Tests end-to-end encryption with vllm-proxy directly. This verifier:
+
+1. Fetches the model's public key from `/v1/attestation/report` endpoint
+2. Generates a client key pair (ECDSA or Ed25519)
+3. Encrypts request message content using the model's public key
+4. Sends encrypted request with encryption headers (`X-Signing-Algo`, `X-Client-Pub-Key`)
+5. Receives encrypted response and decrypts it using the client's private key
+6. Tests both streaming and non-streaming chat completions
+
+### Setup
+
+Set your API key and base URL as environment variables:
+
+```bash
+export API_KEY=your-api-key-here
+export BASE_URL=http://localhost:8000  # or your vllm-proxy URL
+```
+
+Or create a `.env` file:
+
+```bash
+API_KEY=your-api-key-here
+BASE_URL=http://localhost:8000
+```
+
+### Usage
+
+```bash
+cd verifiers
+source .env  # if using .env file
+python3 encryption_verifier.py [OPTIONS]
+```
+
+### Options
+
+- `--model MODEL_NAME`: Model name (default: `phala/deepseek-chat-v3-0324`)
+- `--base-url URL`: Base URL for vllm-proxy (overrides `BASE_URL` env var)
+- `--signing-algo {ecdsa,ed25519}`: Signing algorithm to use (default: `ecdsa`)
+- `--test-both`: Test both ECDSA and Ed25519 algorithms
+
+### Examples
+
+Test with ECDSA (default):
+```bash
+python3 encryption_verifier.py --model phala/deepseek-chat-v3-0324
+```
+
+Test with Ed25519:
+```bash
+python3 encryption_verifier.py --signing-algo ed25519
+```
+
+Test both algorithms:
+```bash
+python3 encryption_verifier.py --test-both
+```
+
+Test against a specific vllm-proxy instance:
+```bash
+python3 encryption_verifier.py --base-url http://your-vllm-proxy:8000
+```
+
+### Example Output
+
+```
+Testing against: http://localhost:8000
+API Key: Set
+
+============================================================
+Encrypted Streaming Example (ECDSA)
+============================================================
+✓ Fetched model public key: 0123456789abcdef0123456789abcdef...
+✓ Generated client key pair: fedcba9876543210fedcba9876543210...
+✓ Encrypted message content
+✓ Request sent successfully (HTTP 200)
+
+Receiving stream...
+✓ Chat ID: chatcmpl-abc123...
+  Decrypted chunk: Hello
+  Decrypted chunk: !
+  Decrypted chunk:  How
+  Decrypted chunk:  can
+  Decrypted chunk:  I
+  Decrypted chunk:  help
+  Decrypted chunk:  you
+  Decrypted chunk: ?
+
+✓ Complete decrypted response: Hello! How can I help you?
+✓ Total response length: 1234 bytes
+
+============================================================
+Encrypted Non-Streaming Example (ECDSA)
+============================================================
+✓ Fetched model public key: 0123456789abcdef0123456789abcdef...
+✓ Generated client key pair: fedcba9876543210fedcba9876543210...
+✓ Encrypted message content
+✓ Request sent successfully (HTTP 200)
+✓ Chat ID: chatcmpl-xyz789...
+✓ Decrypted response: Hello! How can I help you?
+```
+
+### Encryption Details
+
+- **ECDSA**: Uses ECIES (Elliptic Curve Integrated Encryption Scheme) with AES-GCM
+- **Ed25519**: Uses X25519 key exchange + ChaCha20-Poly1305 encryption (via PyNaCl Box)
+
+The encryption follows the same scheme as implemented in vllm-proxy:
+- Request message content is encrypted as hex strings
+- Response message content is encrypted as hex strings
+- Only message content is encrypted, not the entire request/response body
