@@ -73,9 +73,7 @@ def invalid_signing_algo():
     )
 
 
-def http_exception(
-    status_code: int, message: str, request_id: Optional[str] = None
-):
+def http_exception(status_code: int, message: str, request_id: Optional[str] = None):
     return error(
         status_code=status_code,
         message=message,
