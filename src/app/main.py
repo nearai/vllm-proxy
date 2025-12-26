@@ -132,7 +132,23 @@ def _get_error_message(exc: HTTPException) -> str:
         500: "Internal server error",
     }
 
-    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    # Safely extract detail string, with fallback for edge cases
+    try:
+        if isinstance(exc.detail, str):
+            detail = exc.detail
+        elif exc.detail is None:
+            detail = ""
+        else:
+            detail_str = str(exc.detail)
+            detail = detail_str[:500]  # Limit to 500 chars for safety
+    except Exception:
+        # If detail extraction fails for any reason, use empty string
+        # This handles cases where __str__ might raise an exception
+        detail = ""
+
+    # If we got an empty detail, return generic message immediately
+    if not detail:
+        return generic_messages.get(exc.status_code, "An error occurred")
 
     # Preserve detail for specific status codes where it's always safe
     if exc.status_code in PRESERVE_DETAIL_STATUS_CODES:
