@@ -785,8 +785,19 @@ async def test_chat_completions_rejects_oversized_request():
     assert "error" in response_data
     assert "message" in response_data["error"]
     assert "type" in response_data["error"]
-    # The global exception handler sanitizes the message
     assert response_data["error"]["type"] == "http_exception"
+
+    # Verify the actual error detail is preserved (not replaced with generic message)
+    # This is important for 413 errors where the message includes useful info like max size
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "100 bytes" in response_data["error"]["message"]
+
+    # Verify request_id is included for debugging/support purposes
+    assert "request_id" in response_data["error"]
+    assert response_data["error"]["request_id"] is not None
+
+    # Verify X-Request-ID header is present
+    assert "X-Request-ID" in response.headers
 
 
 @pytest.mark.asyncio
@@ -825,6 +836,12 @@ async def test_completions_rejects_oversized_request():
     assert "type" in response_data["error"]
     assert response_data["error"]["type"] == "http_exception"
 
+    # Verify the actual error detail is preserved for 413
+    assert "Request body too large" in response_data["error"]["message"]
+
+    # Verify request_id is included
+    assert "request_id" in response_data["error"]
+
 
 @pytest.mark.asyncio
 async def test_chat_completions_streaming_rejects_oversized_request():
@@ -856,6 +873,8 @@ async def test_chat_completions_streaming_rejects_oversized_request():
     response_data = response.json()
     assert "error" in response_data
     assert response_data["error"]["type"] == "http_exception"
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "request_id" in response_data["error"]
 
 
 @pytest.mark.asyncio
@@ -886,3 +905,100 @@ async def test_tokenize_rejects_oversized_request():
     response_data = response.json()
     assert "error" in response_data
     assert response_data["error"]["type"] == "http_exception"
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "request_id" in response_data["error"]
+
+
+# ============================================================================
+# Request ID Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_request_id_header_returned_on_success(respx_mock):
+    """Test that X-Request-ID header is returned on successful requests."""
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    response_data = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hi"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+    # Verify X-Request-ID header is present
+    assert "X-Request-ID" in response.headers
+    # Request ID should be a valid UUID format
+    request_id = response.headers["X-Request-ID"]
+    assert len(request_id) > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_request_id_header_preserved_from_client(respx_mock):
+    """Test that X-Request-ID from client is preserved in response."""
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    response_data = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hi"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    client_request_id = "client-provided-request-id-12345"
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-ID": client_request_id,
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.called
+    # Verify client's request ID is preserved
+    assert response.headers["X-Request-ID"] == client_request_id
