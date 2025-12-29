@@ -163,10 +163,9 @@ def _create_ed25519_context() -> SigningContext:
 
 
 def _create_ecdsa_context() -> SigningContext:
-    key_bytes = _derive_key_from_kms("ecdsa-signing-key", purpose="signing")
-
     w3 = web3.Web3()
-    account = w3.eth.account.from_key(key_bytes.hex())
+    key_bytes = _derive_key_from_kms("ecdsa-signing-key", purpose="signing")
+    account = w3.eth.account.from_key(key_bytes)
 
     signing_address = account.address
     # Use the 20-byte Ethereum address for attestation (standard verification identifier)
