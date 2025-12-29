@@ -21,6 +21,9 @@ ECDSA = "ecdsa"
 GPU_ARCH = "HOPPER"
 NO_GPU_MODE = os.getenv("GPU_NO_HW_MODE", "0").lower() in {"1", "true", "yes"}
 DEV_MODE = os.getenv("DEV", "0").lower() in {"1", "true", "yes"}
+MODEL_NAME = os.getenv("MODEL_NAME")
+if not MODEL_NAME:
+    raise ValueError("MODEL_NAME is not set")
 
 
 @dataclass
@@ -122,14 +125,6 @@ def _build_nvidia_payload(nonce_hex: str, evidences: list) -> str:
     return json.dumps(data)
 
 
-def _get_model_name() -> str:
-    """Get model name from environment variable."""
-    model_name = os.getenv("MODEL_NAME")
-    if not model_name:
-        raise ValueError("MODEL_NAME environment variable is not set")
-    return model_name
-
-
 def _derive_key_from_kms(path: str, purpose: str = "signing") -> bytes:
     """Derive a deterministic key from KMS.
 
@@ -154,8 +149,7 @@ def _derive_key_from_kms(path: str, purpose: str = "signing") -> bytes:
 
 def _create_ed25519_context() -> SigningContext:
     if not DEV_MODE:
-        model_name = _get_model_name()
-        key_path = f"{model_name}/ed25519-signing-key"
+        key_path = f"{MODEL_NAME}/ed25519-signing-key"
         key_bytes = _derive_key_from_kms(key_path, purpose="signing")
         private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
     else:
@@ -180,8 +174,7 @@ def _create_ed25519_context() -> SigningContext:
 def _create_ecdsa_context() -> SigningContext:
     w3 = web3.Web3()
     if not DEV_MODE:
-        model_name = _get_model_name()
-        key_path = f"{model_name}/ecdsa-signing-key"
+        key_path = f"{MODEL_NAME}/ecdsa-signing-key"
         key_bytes = _derive_key_from_kms(key_path, purpose="signing")
         account = w3.eth.account.from_key(key_bytes)
     else:
