@@ -148,8 +148,8 @@ def _create_ed25519_context() -> SigningContext:
         key_bytes = _derive_key_from_kms("ed25519-signing-key", purpose="signing")
         private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
     except Exception as e:
-        log.error("Failed to derive Ed25519 key from KMS, falling back to creating new key")
         private_key = Ed25519PrivateKey.generate()
+        log.error("Failed to derive Ed25519 key from KMS, falling back to creating new key")
 
     public_key_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
