@@ -145,16 +145,12 @@ def _derive_key_from_kms(path: str, purpose: str = "signing") -> bytes:
 
 
 def _create_ed25519_context() -> SigningContext:
-    try:
+    if not DEV_MODE:
         key_bytes = _derive_key_from_kms("ed25519-signing-key", purpose="signing")
         private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
-    except Exception as e:
-        if DEV_MODE:
-            private_key = Ed25519PrivateKey.generate()
-            log.warning("Failed to derive Ed25519 key from KMS, falling back to random key generation (DEV mode enabled)")
-        else:
-            log.error(f"Failed to derive Ed25519 key from KMS: {type(e).__name__}")
-            raise
+    else:
+        private_key = Ed25519PrivateKey.generate()
+        log.info("DEV mode enabled: generating random Ed25519 key pair")
 
     public_key_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -173,16 +169,12 @@ def _create_ed25519_context() -> SigningContext:
 
 def _create_ecdsa_context() -> SigningContext:
     w3 = web3.Web3()
-    try:
+    if not DEV_MODE:
         key_bytes = _derive_key_from_kms("ecdsa-signing-key", purpose="signing")
         account = w3.eth.account.from_key(key_bytes)
-    except Exception as e:
-        if DEV_MODE:
-            account = w3.eth.account.create()
-            log.warning("Failed to derive ECDSA key from KMS, falling back to random key generation (DEV mode enabled)")
-        else:
-            log.error(f"Failed to derive ECDSA key from KMS: {type(e).__name__}")
-            raise
+    else:
+        account = w3.eth.account.create()
+        log.info("DEV mode enabled: generating random ECDSA key pair")
 
     signing_address = account.address
     # Use the 20-byte Ethereum address for attestation (standard verification identifier)
