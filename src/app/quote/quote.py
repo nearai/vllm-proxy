@@ -20,6 +20,7 @@ ED25519 = "ed25519"
 ECDSA = "ecdsa"
 GPU_ARCH = "HOPPER"
 NO_GPU_MODE = os.getenv("GPU_NO_HW_MODE", "0").lower() in {"1", "true", "yes"}
+DEV_MODE = os.getenv("DEV", "0").lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -121,8 +122,36 @@ def _build_nvidia_payload(nonce_hex: str, evidences: list) -> str:
     return json.dumps(data)
 
 
+def _derive_key_from_kms(path: str, purpose: str = "signing") -> bytes:
+    """Derive a deterministic key from KMS.
+
+    Args:
+        path: Key derivation path (e.g., "ed25519-signing-key")
+        purpose: Purpose string for key derivation (default: "signing")
+
+    Returns:
+        32-byte key material as bytes
+    """
+    try:
+        client = DstackClient()
+        key_response = client.get_key(path=path, purpose=purpose)
+        key_bytes = key_response.decode_key()
+        if len(key_bytes) != 32:
+            raise ValueError(f"Expected 32-byte key, got {len(key_bytes)} bytes")
+        return key_bytes
+    except Exception as e:
+        log.error(f"Failed to derive key with path '{path}': {type(e).__name__}")
+        raise
+
+
 def _create_ed25519_context() -> SigningContext:
-    private_key = Ed25519PrivateKey.generate()
+    if not DEV_MODE:
+        key_bytes = _derive_key_from_kms("ed25519-signing-key", purpose="signing")
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+    else:
+        private_key = Ed25519PrivateKey.generate()
+        log.info("DEV mode enabled: generating random Ed25519 key pair")
+
     public_key_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -140,7 +169,13 @@ def _create_ed25519_context() -> SigningContext:
 
 def _create_ecdsa_context() -> SigningContext:
     w3 = web3.Web3()
-    account = w3.eth.account.create()
+    if not DEV_MODE:
+        key_bytes = _derive_key_from_kms("ecdsa-signing-key", purpose="signing")
+        account = w3.eth.account.from_key(key_bytes)
+    else:
+        account = w3.eth.account.create()
+        log.info("DEV mode enabled: generating random ECDSA key pair")
+
     signing_address = account.address
     # Use the 20-byte Ethereum address for attestation (standard verification identifier)
     address_bytes = bytes.fromhex(signing_address[2:])  # Remove '0x' prefix
