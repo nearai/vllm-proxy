@@ -1,4 +1,4 @@
 #!/bin/bash
 
 . .venv/bin/activate
-PYTHONPATH=src python -m pytest tests/ -v "$@"
+PYTHONPATH=src DEV=1 python -m pytest tests/ -v "$@"

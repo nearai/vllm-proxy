@@ -20,6 +20,7 @@ ED25519 = "ed25519"
 ECDSA = "ecdsa"
 GPU_ARCH = "HOPPER"
 NO_GPU_MODE = os.getenv("GPU_NO_HW_MODE", "0").lower() in {"1", "true", "yes"}
+DEV_MODE = os.getenv("DEV", "0").lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -148,8 +149,12 @@ def _create_ed25519_context() -> SigningContext:
         key_bytes = _derive_key_from_kms("ed25519-signing-key", purpose="signing")
         private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
     except Exception as e:
-        private_key = Ed25519PrivateKey.generate()
-        log.error("Failed to derive Ed25519 key from KMS, falling back to creating new key")
+        if DEV_MODE:
+            private_key = Ed25519PrivateKey.generate()
+            log.warning("Failed to derive Ed25519 key from KMS, falling back to random key generation (DEV mode enabled)")
+        else:
+            log.error(f"Failed to derive Ed25519 key from KMS: {type(e).__name__}")
+            raise
 
     public_key_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -170,10 +175,14 @@ def _create_ecdsa_context() -> SigningContext:
     w3 = web3.Web3()
     try:
         key_bytes = _derive_key_from_kms("ecdsa-signing-key", purpose="signing")
-        account = w3.eth.account.from_key(key_bytes.hex())
+        account = w3.eth.account.from_key(key_bytes)
     except Exception as e:
-        account = w3.eth.account.create()
-        log.error("Failed to derive ECDSA key from KMS, falling back to creating new key")
+        if DEV_MODE:
+            account = w3.eth.account.create()
+            log.warning("Failed to derive ECDSA key from KMS, falling back to random key generation (DEV mode enabled)")
+        else:
+            log.error(f"Failed to derive ECDSA key from KMS: {type(e).__name__}")
+            raise
 
     signing_address = account.address
     # Use the 20-byte Ethereum address for attestation (standard verification identifier)
