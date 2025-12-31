@@ -23,7 +23,9 @@ fastapi dev main.py --host 0.0.0.0
 ### Build for production
 
 ```bash
+# Compile the requirements.lock.txt with locked dependencies
 bash compile-requirements.sh
+# Build reproducible docker image
 bash build-image.sh
 ```
 
