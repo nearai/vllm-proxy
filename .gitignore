@@ -166,3 +166,7 @@ cython_debug/
 
 .ruff_cache
 tmp/
+
+# Build artifacts
+oci.tar
+.GIT_REV

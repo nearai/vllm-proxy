@@ -17,13 +17,20 @@ uvicorn main:app --host 0.0.0.0 --reload
 fastapi dev main.py --host 0.0.0.0
 ```
 
+## Update Dependencies
+
+```bash
+# Compile requirements.txt into requirements.lock.txt with locked dependencies
+bash compile-requirements.sh
+```
 
 ## Production 
 
 ### Build for production
 
 ```bash
-bash docker/build.sh
+# Build reproducible docker image
+bash build-image.sh
 ```
 
 ### Run for production
