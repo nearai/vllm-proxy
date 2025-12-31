@@ -23,7 +23,8 @@ fastapi dev main.py --host 0.0.0.0
 ### Build for production
 
 ```bash
-bash docker/build.sh
+bash compile-requirements.sh
+bash build-image.sh
 ```
 
 ### Run for production

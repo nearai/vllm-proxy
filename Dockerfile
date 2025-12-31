@@ -11,12 +11,12 @@ ENV PYTHONHASHSEED=0 \
 # Install dependencies
 WORKDIR /tmp
 
-# Install packages via requirements.txt instead of poetry
+# Install packages via requirements.lock.txt instead of poetry
 # because of nv-ppcie-verifier requires some old version packages,
 # which is not compatible with lots of current dependencies.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && rm -rf requirements.txt
+COPY requirement.lock.txt ./
+RUN pip install --require-hashes --no-cache-dir -r requirement.lock.txt \
+    && rm -rf requirement.lock.txt
 
 # Copy source code
 WORKDIR /app
