@@ -72,3 +72,6 @@ verifiers/
 # Temporary files
 *.tmp
 *.bak
+
+# GitHub Actions
+.github/
