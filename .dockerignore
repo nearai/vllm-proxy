@@ -51,6 +51,7 @@ dmypy.json
 # Build and deployment scripts
 build-image.sh
 run_tests.sh
+compile-requirements.sh
 Dockerfile
 .dockerignore
 

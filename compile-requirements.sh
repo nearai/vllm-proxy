@@ -18,10 +18,22 @@ if [ ! -f requirements.txt ]; then
     exit 1
 fi
 
-# Check if pip-tools is installed
+# Check if pip-tools is installed with the correct version
+# Pin version for security and reproducibility (update periodically after review)
+PIP_TOOLS_VERSION="7.5.2"
+PIP_TOOLS_PACKAGE="pip-tools==${PIP_TOOLS_VERSION}"
+
 if ! command -v pip-compile &> /dev/null; then
-    echo "pip-tools not found. Installing pip-tools..."
-    pip install pip-tools
+    echo "pip-tools not found. Installing pip-tools==${PIP_TOOLS_VERSION}..."
+    pip install --no-cache-dir "${PIP_TOOLS_PACKAGE}"
+else
+    # Check if installed version matches (allows for manual updates if needed)
+    INSTALLED_VERSION=$(pip show pip-tools 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "${INSTALLED_VERSION}" != "${PIP_TOOLS_VERSION}" ]; then
+        echo "pip-tools version mismatch (installed: ${INSTALLED_VERSION:-unknown}, required: ${PIP_TOOLS_VERSION})."
+        echo "Installing pip-tools==${PIP_TOOLS_VERSION}..."
+        pip install --no-cache-dir --upgrade "${PIP_TOOLS_PACKAGE}"
+    fi
 fi
 
 echo "Compiling requirements.txt to requirements.lock.txt..."
