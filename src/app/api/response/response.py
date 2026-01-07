@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi.responses import JSONResponse
 
 
@@ -11,15 +13,34 @@ def error(
     type: str = "error_type",
     param: str = None,
     code: str = None,
+    request_id: Optional[str] = None,
 ):
-    content = dict(
-        error=dict(
-            message=message,
-            type=type,
-            param=param,
-            code=code,
-        )
+    """
+    Create an OpenAI-style error response.
+
+    Args:
+        status_code: HTTP status code
+        message: Human-readable error message
+        type: Error type identifier
+        param: Optional parameter that caused the error
+        code: Optional error code
+        request_id: Optional request ID for debugging/support
+
+    Returns:
+        JSONResponse with OpenAI-compatible error structure
+    """
+    error_content = dict(
+        message=message,
+        type=type,
+        param=param,
+        code=code,
     )
+
+    # Include request_id in error object if provided
+    if request_id:
+        error_content["request_id"] = request_id
+
+    content = dict(error=error_content)
     return JSONResponse(status_code=status_code, content=content)
 
 
@@ -52,8 +73,13 @@ def invalid_signing_algo():
     )
 
 
-def http_exception(status_code: int, message: str):
-    return error(status_code=status_code, message=message, type="http_exception")
+def http_exception(status_code: int, message: str, request_id: Optional[str] = None):
+    return error(
+        status_code=status_code,
+        message=message,
+        type="http_exception",
+        request_id=request_id,
+    )
 
 
 def not_found(message: str):

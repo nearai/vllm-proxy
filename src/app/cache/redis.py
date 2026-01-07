@@ -78,7 +78,8 @@ class RedisCache:
             # decode_responses=True handles decoding automatically
             return self.redis_client.get(key)
         except redis.RedisError as e:
-            log.error("Redis get error: %s", e)
+            # Log only exception type to avoid leaking user data
+            log.error("Redis get error: %s", type(e).__name__)
             self._open_circuit()
             return None
 
@@ -112,6 +113,7 @@ class RedisCache:
                     values.append(value)
             return values
         except redis.RedisError as e:
-            log.error("Redis scan error: %s", e)
+            # Log only exception type to avoid leaking user data
+            log.error("Redis scan error: %s", type(e).__name__)
             self._open_circuit()
             return []
