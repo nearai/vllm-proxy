@@ -244,7 +244,10 @@ async def test_signature_invalid_algo():
         # Verify error response
         assert response.status_code == 400
         response_data = response.json()
-        assert response_data["error"]["message"] == "Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+        assert (
+            response_data["error"]["message"]
+            == "Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+        )
         assert response_data["error"]["type"] == "invalid_signing_algo"
 
 
@@ -589,3 +592,413 @@ async def test_chat_completions_without_request_hash(respx_mock):
 
         # Verify cache was called
         mock_cache.set_chat.assert_called_once()
+
+
+# ============================================================================
+# Request Size Limiting Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_chat_completions_within_size_limit(respx_mock):
+    """Test that requests within size limit succeed normally."""
+    # Test request data (small payload - well under 10MB default limit)
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    # Mock response
+    chat_id = "chatcmpl-size-test"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hello back"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_function_rejects_large_body():
+    """Test that read_body_with_limit rejects bodies exceeding the limit."""
+    from app.api.v1.openai import read_body_with_limit
+    from fastapi import HTTPException
+
+    # Create a mock request with a large body
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            # Yield in chunks
+            chunk_size = 100
+            for i in range(0, len(self._body), chunk_size):
+                yield self._body[i : i + chunk_size]
+
+    # Test with body exceeding limit
+    large_body = b"A" * 500
+    mock_request = MockRequest(large_body)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_body_with_limit(mock_request, max_size=100)
+
+    assert exc_info.value.status_code == 413
+    assert "Request body too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_accepts_valid_body():
+    """Test that read_body_with_limit accepts bodies within the limit."""
+    from app.api.v1.openai import read_body_with_limit
+
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            yield self._body
+
+    # Test with body within limit
+    small_body = b'{"model": "test"}'
+    mock_request = MockRequest(small_body)
+
+    result = await read_body_with_limit(mock_request, max_size=1000)
+    assert result == small_body
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_rejects_large_content_length():
+    """Test that read_body_with_limit rejects based on Content-Length header."""
+    from app.api.v1.openai import read_body_with_limit
+    from fastapi import HTTPException
+
+    class MockRequest:
+        def __init__(self, body_content: bytes, content_length: str = None):
+            self._body = body_content
+            self._headers = {}
+            if content_length:
+                self._headers["content-length"] = content_length
+
+        @property
+        def headers(self):
+            return self._headers
+
+        async def stream(self):
+            yield self._body
+
+    # Test with Content-Length header exceeding limit
+    small_body = b'{"model": "test"}'
+    mock_request = MockRequest(small_body, content_length="999999999")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_body_with_limit(mock_request, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "Request body too large" in str(exc_info.value.detail)
+
+
+# ============================================================================
+# Integration Tests for Request Size Limiting via API Endpoints
+# ============================================================================
+
+
+def _create_limited_read_body(original_func, max_size: int):
+    """Create a wrapper that calls read_body_with_limit with a custom max_size."""
+
+    async def limited_read_body(request):
+        return await original_func(request, max_size=max_size)
+
+    return limited_read_body
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/chat/completions rejects requests
+    exceeding the size limit with proper 413 status code and error format.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    # Create an oversized request by including a very large message content
+    # We patch read_body_with_limit with a wrapper that uses a small limit
+    large_content = "x" * 1000  # 1000 character message
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": False,
+    }
+
+    # Patch with a wrapper that enforces a 100-byte limit
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Verify 413 Payload Too Large status code
+    assert response.status_code == 413
+
+    # Verify error response format matches OpenAI-style error structure
+    response_data = response.json()
+    assert "error" in response_data
+    assert "message" in response_data["error"]
+    assert "type" in response_data["error"]
+    assert response_data["error"]["type"] == "http_exception"
+
+    # Verify the actual error detail is preserved (not replaced with generic message)
+    # This is important for 413 errors where the message includes useful info like max size
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "100 bytes" in response_data["error"]["message"]
+
+    # Verify request_id is included for debugging/support purposes
+    assert "request_id" in response_data["error"]
+    assert response_data["error"]["request_id"] is not None
+
+    # Verify X-Request-ID header is present
+    assert "X-Request-ID" in response.headers
+
+
+@pytest.mark.asyncio
+async def test_completions_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/completions rejects requests
+    exceeding the size limit with proper 413 status code and error format.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    # Create an oversized request with a large prompt
+    large_prompt = "y" * 1000  # 1000 character prompt
+    request_data = {
+        "model": "test-model",
+        "prompt": large_prompt,
+        "stream": False,
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Verify 413 Payload Too Large status code
+    assert response.status_code == 413
+
+    # Verify error response format matches OpenAI-style error structure
+    response_data = response.json()
+    assert "error" in response_data
+    assert "message" in response_data["error"]
+    assert "type" in response_data["error"]
+    assert response_data["error"]["type"] == "http_exception"
+
+    # Verify the actual error detail is preserved for 413
+    assert "Request body too large" in response_data["error"]["message"]
+
+    # Verify request_id is included
+    assert "request_id" in response_data["error"]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/chat/completions with streaming enabled
+    also rejects oversized requests before attempting to stream.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    large_content = "z" * 1000
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": large_content}],
+        "stream": True,  # Streaming enabled
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Size check happens before streaming starts, so we get 413
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "error" in response_data
+    assert response_data["error"]["type"] == "http_exception"
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "request_id" in response_data["error"]
+
+
+@pytest.mark.asyncio
+async def test_tokenize_rejects_oversized_request():
+    """
+    Integration test: Verify that /v1/tokenize endpoint also enforces
+    request size limits.
+    """
+    from app.api.v1.openai import read_body_with_limit
+
+    large_text = "w" * 1000
+    request_data = {
+        "model": "test-model",
+        "text": large_text,
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/tokenize",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "error" in response_data
+    assert response_data["error"]["type"] == "http_exception"
+    assert "Request body too large" in response_data["error"]["message"]
+    assert "request_id" in response_data["error"]
+
+
+# ============================================================================
+# Request ID Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_request_id_header_returned_on_success(respx_mock):
+    """Test that X-Request-ID header is returned on successful requests."""
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    response_data = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hi"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+    # Verify X-Request-ID header is present
+    assert "X-Request-ID" in response.headers
+    # Request ID should be a valid UUID format
+    request_id = response.headers["X-Request-ID"]
+    assert len(request_id) > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_request_id_header_preserved_from_client(respx_mock):
+    """Test that X-Request-ID from client is preserved in response."""
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    }
+
+    response_data = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hi"},
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    client_request_id = "client-provided-request-id-12345"
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/chat/completions",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-ID": client_request_id,
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.called
+    # Verify client's request ID is preserved
+    assert response.headers["X-Request-ID"] == client_request_id
