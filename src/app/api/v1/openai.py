@@ -42,6 +42,7 @@ VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
 VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/tokenize"
 VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
+VLLM_IMAGES_GENERATIONS_URL = f"{VLLM_BASE_URL}/v1/images/generations"
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -850,3 +851,68 @@ async def models(request: Request):
             status_code=response.status_code, detail="Failed to fetch models"
         )
     return JSONResponse(content=response.json())
+
+
+# VLLM Image generations
+@router.post("/images/generations", dependencies=[Depends(verify_authorization_header)])
+async def images_generations(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+):
+    """
+    Image generations endpoint - proxies to vLLM backend.
+
+    Follows the OpenAI Images API format:
+    - model: The model to use for image generation
+    - prompt: Text description of the desired image(s)
+    - n: Number of images to generate (default 1)
+    - size: Size of the generated images (e.g., "1024x1024")
+    - response_format: Format of the generated images ("url" or "b64_json")
+
+    The response is signed and cached for verification.
+    """
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    client = get_http_client()
+    response = await client.post(
+        VLLM_IMAGES_GENERATIONS_URL,
+        content=modified_request_body,
+    )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Cache the request-response pair using the response ID (if present)
+    # For images, the 'created' timestamp can serve as a unique identifier
+    response_id = response_data.get("id") or f"img-{response_data.get('created', '')}"
+    if response_id:
+        response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
+        response_sha256 = sha256(response_body).hexdigest()
+        cache.set_chat(
+            response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        )
+
+    return JSONResponse(content=response_data)

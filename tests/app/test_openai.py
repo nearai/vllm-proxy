@@ -1002,3 +1002,150 @@ async def test_request_id_header_preserved_from_client(respx_mock):
     assert route.called
     # Verify client's request ID is preserved
     assert response.headers["X-Request-ID"] == client_request_id
+
+
+# ============================================================================
+# Image Generation Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_generations_success(respx_mock):
+    """Test that /v1/images/generations proxies requests successfully."""
+    request_data = {
+        "model": "dall-e-3",
+        "prompt": "A beautiful sunset over mountains",
+        "n": 1,
+        "size": "1024x1024",
+    }
+
+    # Mock response data matching OpenAI Images API format
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "url": "https://example.com/image.png",
+                "revised_prompt": "A stunning sunset over snow-capped mountains",
+            }
+        ],
+    }
+
+    # Setup RESPX mock for images generations endpoint
+    route = respx_mock.post(f"{VLLM_BASE_URL}/v1/images/generations").mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/images/generations",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+    # Verify response content
+    result = response.json()
+    assert "created" in result
+    assert "data" in result
+    assert len(result["data"]) == 1
+    assert result["data"][0]["url"] == "https://example.com/image.png"
+
+    # Verify cache was called
+    mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_generations_with_request_hash(respx_mock):
+    """Test that /v1/images/generations uses client-provided X-Request-Hash."""
+    request_data = {
+        "model": "dall-e-3",
+        "prompt": "A cat sitting on a couch",
+        "n": 1,
+        "size": "512x512",
+    }
+
+    expected_hash = "custom-image-hash-from-client"
+
+    response_data = {
+        "created": 1677825464,
+        "data": [{"url": "https://example.com/cat.png"}],
+    }
+
+    route = respx_mock.post(f"{VLLM_BASE_URL}/v1/images/generations").mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/images/generations",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+    # Verify that the client-provided hash was logged
+    mock_log.info.assert_called_with(
+        f"Using client-provided request hash: {expected_hash}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_generations_upstream_error(respx_mock):
+    """Test that /v1/images/generations handles upstream errors correctly."""
+    request_data = {
+        "model": "dall-e-3",
+        "prompt": "Invalid request",
+    }
+
+    # Setup RESPX mock with error response
+    route = respx_mock.post(f"{VLLM_BASE_URL}/v1/images/generations").mock(
+        return_value=httpx.Response(400, json={"error": "Invalid prompt"})
+    )
+
+    response = client.post(
+        "/v1/images/generations",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 400
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_images_generations_rejects_oversized_request():
+    """Test that /v1/images/generations rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_prompt = "x" * 1000
+    request_data = {
+        "model": "dall-e-3",
+        "prompt": large_prompt,
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/images/generations",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "error" in response_data
+    assert "Request body too large" in response_data["error"]["message"]
