@@ -20,6 +20,10 @@ from app.api.response.response import (
     unexpect_error,
 )
 from app.cache.cache import cache
+from app.encryption.encryption import (
+    decrypt_data,
+    encrypt_data,
+)
 from app.logger import log
 from app.quote.quote import (
     ECDSA,
@@ -29,10 +33,6 @@ from app.quote.quote import (
     ed25519_context,
     generate_attestation,
     sign_message,
-)
-from app.encryption.encryption import (
-    encrypt_data,
-    decrypt_data,
 )
 
 router = APIRouter(tags=["openai"])
@@ -265,10 +265,13 @@ def decrypt_message_content(message: dict, context: SigningContext) -> dict:
             parsed = json.loads(decrypted)
             if isinstance(parsed, list):
                 message["content"] = parsed
-            else:
-                message["content"] = decrypted
+                return message
         except json.JSONDecodeError:
-            message["content"] = decrypted
+            # Not JSON, so it's plain text.
+            pass
+
+        # If it wasn't a JSON list, assign the original decrypted string.
+        message["content"] = decrypted
 
     return message
 
@@ -850,6 +853,11 @@ async def images_generations(
     response = await client.post(VLLM_IMAGES_URL, content=modified_request_body)
 
     if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_IMAGES_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
         raise HTTPException(
             status_code=response.status_code, detail="Upstream service error"
         )
@@ -857,7 +865,10 @@ async def images_generations(
     response_data = response.json()
 
     # Encrypt response fields if encryption is enabled
-    if encrypt_enabled and x_client_pub_key and x_signing_algo:
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
         if "data" in response_data and isinstance(response_data["data"], list):
             for item in response_data["data"]:
                 if "b64_json" in item and item["b64_json"]:
@@ -876,9 +887,9 @@ async def images_generations(
         response_data["id"] = response_id
 
     # Hash the response and cache signature
-    encrypted_response_body = json.dumps(
-        response_data, separators=(",", ":")
-    ).encode("utf-8")
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
     response_sha256 = sha256(encrypted_response_body).hexdigest()
     cache.set_chat(
         response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
