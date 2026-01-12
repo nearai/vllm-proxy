@@ -309,23 +309,22 @@ def encrypt_message_content(
                     )
 
     # Handle Qwen3-Omni audio output: encrypt message.audio.data field
-    if "audio" in message and message["audio"] is not None:
-        audio = message["audio"]
-        if isinstance(audio, dict):
-            message["audio"] = dict(audio)  # Copy to avoid mutating original
-            if "data" in message["audio"] and message["audio"]["data"]:
-                try:
-                    audio_data = message["audio"]["data"]
-                    if isinstance(audio_data, str):
-                        encrypted_data = encrypt_data(
-                            audio_data.encode("utf-8"), client_public_key, signing_algo
-                        )
-                        message["audio"]["data"] = encrypted_data.hex()
-                except Exception as e:
-                    log.error(f"Failed to encrypt message audio.data: {type(e).__name__}")
-                    raise HTTPException(
-                        status_code=500, detail="Failed to encrypt message audio.data"
-                    )
+    if "audio" in message and isinstance(message.get("audio"), dict):
+        audio_copy = message["audio"].copy()  # Copy to avoid mutating original
+        message["audio"] = audio_copy
+
+        audio_data = audio_copy.get("data")
+        if isinstance(audio_data, str) and audio_data:
+            try:
+                encrypted_data = encrypt_data(
+                    audio_data.encode("utf-8"), client_public_key, signing_algo
+                )
+                audio_copy["data"] = encrypted_data.hex()
+            except Exception as e:
+                log.error(f"Failed to encrypt message audio.data: {type(e).__name__}")
+                raise HTTPException(
+                    status_code=500, detail="Failed to encrypt message audio.data"
+                )
 
     return message
 
@@ -426,6 +425,10 @@ async def stream_vllm_response(
 
                     try:
                         chunk_data = json.loads(data)
+
+                        # Note: The 'modality' field (used by Qwen3-Omni for audio streaming)
+                        # is preserved at the chunk level since we only modify choices[].delta
+                        # and choices[].text, not the top-level chunk fields.
 
                         # Encrypt content in choices[].delta or choices[].text (for completions)
                         if "choices" in chunk_data:
