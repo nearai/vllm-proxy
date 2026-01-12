@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from hashlib import sha256
 from typing import Optional
 
@@ -19,6 +20,10 @@ from app.api.response.response import (
     unexpect_error,
 )
 from app.cache.cache import cache
+from app.encryption.encryption import (
+    decrypt_data,
+    encrypt_data,
+)
 from app.logger import log
 from app.quote.quote import (
     ECDSA,
@@ -29,10 +34,6 @@ from app.quote.quote import (
     generate_attestation,
     sign_message,
 )
-from app.encryption.encryption import (
-    encrypt_data,
-    decrypt_data,
-)
 
 router = APIRouter(tags=["openai"])
 
@@ -42,6 +43,8 @@ VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
 VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/tokenize"
 VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
+# Image generation endpoint - can be overridden to point to a different service
+VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -65,6 +68,18 @@ MAX_KEEPALIVE_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_KEEPALIVE", 100)
 # Maximum request body size (default 10MB) - prevents memory exhaustion attacks
 # Critical for TEE environments with limited memory
 MAX_REQUEST_SIZE = _get_env_as_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024)
+
+# Maximum request body size for image requests (default 50MB per OpenAI docs)
+# Larger limit needed for base64-encoded images
+MAX_IMAGE_REQUEST_SIZE = _get_env_as_int(
+    "VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024
+)
+
+# Maximum request body size for audio/multimodal requests (default 100MB)
+# Larger limit needed for base64-encoded audio in Qwen3-Omni multimodal requests
+MAX_AUDIO_REQUEST_SIZE = _get_env_as_int(
+    "VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024
+)
 
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -241,19 +256,28 @@ def _decrypt_field(field_value: str, context: SigningContext) -> str:
 def decrypt_message_content(message: dict, context: SigningContext) -> dict:
     """
     Decrypt the content field of a message if it's encrypted.
-    Expected format: {"content": "hex_string"} (encrypted)
-    If content is a valid hex string, it will be treated as encrypted and decrypted.
+    Handles both plain text and multimodal content (JSON arrays).
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
-    # Decrypt content field if present and is a string
     if (
         "content" in message
         and message["content"] is not None
         and isinstance(message["content"], str)
         and message["content"]
     ):
-        message["content"] = _decrypt_field(message["content"], context)
+        decrypted = _decrypt_field(message["content"], context)
+        try:
+            parsed = json.loads(decrypted)
+            if isinstance(parsed, list):
+                message["content"] = parsed
+                return message
+        except json.JSONDecodeError:
+            # Not JSON, so it's plain text.
+            pass
+
+        # If it wasn't a JSON list, assign the original decrypted string.
+        message["content"] = decrypted
 
     return message
 
@@ -262,15 +286,17 @@ def encrypt_message_content(
     message: dict, client_public_key: str, signing_algo: str
 ) -> dict:
     """
-    Encrypt the content and reasoning content fields of a message.
-    Returns message with encrypted content and reasoning content as hex strings.
+    Encrypt the content, reasoning content, and audio fields of a message.
+    Handles both plain text and multimodal content (JSON arrays).
+    Also handles Qwen3-Omni audio output in message.audio.data field.
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
-    # Encrypt content and reasoning content fields if present
     for field in ["content", "reasoning_content", "reasoning"]:
         if field in message and message[field] is not None and message[field]:
             content = message[field]
+            if isinstance(content, list):
+                content = json.dumps(content)
             if isinstance(content, str):
                 try:
                     encrypted_data = encrypt_data(
@@ -282,6 +308,27 @@ def encrypt_message_content(
                     raise HTTPException(
                         status_code=500, detail=f"Failed to encrypt message {field}"
                     )
+
+    # Handle Qwen3-Omni audio output: encrypt message.audio.data field
+    if "audio" in message:
+        audio = message.get("audio")
+        if not isinstance(audio, dict):
+            raise HTTPException(
+                status_code=400, detail="Invalid audio field: expected object"
+            )
+        audio_data = audio.get("data")
+        if isinstance(audio_data, str) and audio_data:
+            try:
+                encrypted_data = encrypt_data(
+                    audio_data.encode("utf-8"), client_public_key, signing_algo
+                )
+                # Create copy with encrypted data to avoid mutating original
+                message["audio"] = {**audio, "data": encrypted_data.hex()}
+            except Exception as e:
+                log.error(f"Failed to encrypt message audio.data: {type(e).__name__}")
+                raise HTTPException(
+                    status_code=500, detail="Failed to encrypt message audio.data"
+                )
 
     return message
 
@@ -382,6 +429,10 @@ async def stream_vllm_response(
 
                     try:
                         chunk_data = json.loads(data)
+
+                        # Note: The 'modality' field (used by Qwen3-Omni for audio streaming)
+                        # is preserved at the chunk level since we only modify choices[].delta
+                        # and choices[].text, not the top-level chunk fields.
 
                         # Encrypt content in choices[].delta or choices[].text (for completions)
                         if "choices" in chunk_data:
@@ -620,8 +671,8 @@ async def chat_completions(
         else None
     )
 
-    # Use size-limited read to prevent memory exhaustion attacks
-    request_body = await read_body_with_limit(request)
+    # Use larger size limit to support audio/multimodal content (audio_url in messages)
+    request_body = await read_body_with_limit(request, max_size=MAX_AUDIO_REQUEST_SIZE)
 
     # Parse the request JSON
     try:
@@ -766,6 +817,117 @@ async def completions(
             signing_algo=x_signing_algo if encrypt_enabled else None,
         )
         return JSONResponse(content=response_data)
+
+
+# VLLM images generations
+@router.post("/images/generations", dependencies=[Depends(verify_authorization_header)])
+async def images_generations(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Image generation endpoint with optional end-to-end encryption.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'prompt' field should be encrypted as hex string
+    - Response 'data[].b64_json' and 'data[].revised_prompt' fields will be encrypted
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use larger size limit for image requests
+    request_body = await read_body_with_limit(request, max_size=MAX_IMAGE_REQUEST_SIZE)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt prompt if encryption is enabled
+    if encrypt_enabled and "prompt" in request_json:
+        try:
+            request_json["prompt"] = _decrypt_field(request_json["prompt"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM images endpoint
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+    client = get_http_client()
+    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_IMAGES_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response fields if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "data" in response_data and isinstance(response_data["data"], list):
+            for item in response_data["data"]:
+                if "b64_json" in item and item["b64_json"]:
+                    item["b64_json"] = encrypt_text(
+                        item["b64_json"], x_client_pub_key, x_signing_algo
+                    )
+                if "revised_prompt" in item and item["revised_prompt"]:
+                    item["revised_prompt"] = encrypt_text(
+                        item["revised_prompt"], x_client_pub_key, x_signing_algo
+                    )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
 
 
 # VLLM tokenize

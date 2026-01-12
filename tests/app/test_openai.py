@@ -741,10 +741,16 @@ async def test_read_body_with_limit_rejects_large_content_length():
 
 
 def _create_limited_read_body(original_func, max_size: int):
-    """Create a wrapper that calls read_body_with_limit with a custom max_size."""
+    """Create a wrapper that calls read_body_with_limit with a custom max_size.
+    
+    The wrapper accepts max_size kwarg to match the real function signature,
+    but ignores it and uses the test-configured max_size instead.
+    """
+    test_limit = max_size  # Capture the test-configured limit
 
-    async def limited_read_body(request):
-        return await original_func(request, max_size=max_size)
+    async def limited_read_body(request, max_size: int = None):
+        # Always use the test-configured limit, ignore caller's max_size
+        return await original_func(request, max_size=test_limit)
 
     return limited_read_body
 
