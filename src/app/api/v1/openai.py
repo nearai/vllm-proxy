@@ -45,6 +45,8 @@ VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 # Image generation endpoint - can be overridden to point to a different service
 VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
+# Optional auth token for backend services that require authentication
+VLLM_AUTH_TOKEN = os.getenv("VLLM_AUTH_TOKEN")
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -873,7 +875,9 @@ async def images_generations(
     # Forward to vLLM images endpoint
     modified_request_body = json.dumps(request_json).encode("utf-8")
     client = get_http_client()
-    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body)
+    # Add backend auth header if configured
+    headers = {"Authorization": f"Bearer {VLLM_AUTH_TOKEN}"} if VLLM_AUTH_TOKEN else None
+    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body, headers=headers)
 
     if response.status_code != 200:
         raise HTTPException(
