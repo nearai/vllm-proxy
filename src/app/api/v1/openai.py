@@ -20,6 +20,10 @@ from app.api.response.response import (
     unexpect_error,
 )
 from app.cache.cache import cache
+from app.encryption.encryption import (
+    decrypt_data,
+    encrypt_data,
+)
 from app.logger import log
 from app.quote.quote import (
     ECDSA,
@@ -29,10 +33,6 @@ from app.quote.quote import (
     ed25519_context,
     generate_attestation,
     sign_message,
-)
-from app.encryption.encryption import (
-    encrypt_data,
-    decrypt_data,
 )
 
 router = APIRouter(tags=["openai"])
@@ -45,8 +45,6 @@ VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 # Image generation endpoint - can be overridden to point to a different service
 VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
-# Optional auth token for backend services that require authentication
-VLLM_AUTH_TOKEN = os.getenv("VLLM_AUTH_TOKEN")
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -309,17 +307,20 @@ def encrypt_message_content(
                     )
 
     # Handle Qwen3-Omni audio output: encrypt message.audio.data field
-    if "audio" in message and isinstance(message.get("audio"), dict):
-        audio_copy = message["audio"].copy()  # Copy to avoid mutating original
-        message["audio"] = audio_copy
-
-        audio_data = audio_copy.get("data")
+    if "audio" in message:
+        audio = message.get("audio")
+        if not isinstance(audio, dict):
+            raise HTTPException(
+                status_code=400, detail="Invalid audio field: expected object"
+            )
+        audio_data = audio.get("data")
         if isinstance(audio_data, str) and audio_data:
             try:
                 encrypted_data = encrypt_data(
                     audio_data.encode("utf-8"), client_public_key, signing_algo
                 )
-                audio_copy["data"] = encrypted_data.hex()
+                # Create copy with encrypted data to avoid mutating original
+                message["audio"] = {**audio, "data": encrypted_data.hex()}
             except Exception as e:
                 log.error(f"Failed to encrypt message audio.data: {type(e).__name__}")
                 raise HTTPException(
@@ -878,9 +879,7 @@ async def images_generations(
     # Forward to vLLM images endpoint
     modified_request_body = json.dumps(request_json).encode("utf-8")
     client = get_http_client()
-    # Add backend auth header if configured
-    headers = {"Authorization": f"Bearer {VLLM_AUTH_TOKEN}"} if VLLM_AUTH_TOKEN else None
-    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body, headers=headers)
+    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body)
 
     if response.status_code != 200:
         raise HTTPException(
@@ -909,9 +908,9 @@ async def images_generations(
         response_data["id"] = response_id
 
     # Hash the response and cache signature
-    encrypted_response_body = json.dumps(
-        response_data, separators=(",", ":")
-    ).encode("utf-8")
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
     response_sha256 = sha256(encrypted_response_body).hexdigest()
     cache.set_chat(
         response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))

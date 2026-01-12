@@ -989,6 +989,56 @@ async def test_audio_upstream_error(respx_mock):
 
 @pytest.mark.asyncio
 @pytest.mark.respx
+async def test_audio_output_invalid_audio_field_type(respx_mock):
+    """Test that invalid audio field type in response returns 400 when encryption is enabled."""
+    # Encrypt the request content so decryption succeeds
+    plain_content = "test"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "modalities": ["text", "audio"],
+        "stream": False,
+    }
+
+    # Upstream returns audio as a string instead of an object
+    backend_response = {
+        "id": "chatcmpl-test",
+        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!",
+                    "audio": "invalid-not-a-dict",  # Invalid: should be an object
+                },
+            }
+        ],
+    }
+
+    respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=backend_response)
+    )
+
+    # Send with encryption headers to trigger encrypt_message_content on response
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Invalid audio field" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
 async def test_streaming_audio_signature_verification(respx_mock):
     """Test signature for streaming audio responses."""
     plain_content = "Speak"
