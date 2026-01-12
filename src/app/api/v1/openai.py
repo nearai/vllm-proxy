@@ -75,6 +75,12 @@ MAX_IMAGE_REQUEST_SIZE = _get_env_as_int(
     "VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024
 )
 
+# Maximum request body size for audio/multimodal requests (default 100MB)
+# Larger limit needed for base64-encoded audio in Qwen3-Omni multimodal requests
+MAX_AUDIO_REQUEST_SIZE = _get_env_as_int(
+    "VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024
+)
+
 _http_client: Optional[httpx.AsyncClient] = None
 
 
@@ -280,8 +286,9 @@ def encrypt_message_content(
     message: dict, client_public_key: str, signing_algo: str
 ) -> dict:
     """
-    Encrypt the content and reasoning content fields of a message.
+    Encrypt the content, reasoning content, and audio fields of a message.
     Handles both plain text and multimodal content (JSON arrays).
+    Also handles Qwen3-Omni audio output in message.audio.data field.
     """
     message = dict(message)  # Create a copy to avoid mutating the original
 
@@ -301,6 +308,27 @@ def encrypt_message_content(
                     raise HTTPException(
                         status_code=500, detail=f"Failed to encrypt message {field}"
                     )
+
+    # Handle Qwen3-Omni audio output: encrypt message.audio.data field
+    if "audio" in message:
+        audio = message.get("audio")
+        if not isinstance(audio, dict):
+            raise HTTPException(
+                status_code=400, detail="Invalid audio field: expected object"
+            )
+        audio_data = audio.get("data")
+        if isinstance(audio_data, str) and audio_data:
+            try:
+                encrypted_data = encrypt_data(
+                    audio_data.encode("utf-8"), client_public_key, signing_algo
+                )
+                # Create copy with encrypted data to avoid mutating original
+                message["audio"] = {**audio, "data": encrypted_data.hex()}
+            except Exception as e:
+                log.error(f"Failed to encrypt message audio.data: {type(e).__name__}")
+                raise HTTPException(
+                    status_code=500, detail="Failed to encrypt message audio.data"
+                )
 
     return message
 
@@ -401,6 +429,10 @@ async def stream_vllm_response(
 
                     try:
                         chunk_data = json.loads(data)
+
+                        # Note: The 'modality' field (used by Qwen3-Omni for audio streaming)
+                        # is preserved at the chunk level since we only modify choices[].delta
+                        # and choices[].text, not the top-level chunk fields.
 
                         # Encrypt content in choices[].delta or choices[].text (for completions)
                         if "choices" in chunk_data:
@@ -639,8 +671,8 @@ async def chat_completions(
         else None
     )
 
-    # Use size-limited read to prevent memory exhaustion attacks
-    request_body = await read_body_with_limit(request)
+    # Use larger size limit to support audio/multimodal content (audio_url in messages)
+    request_body = await read_body_with_limit(request, max_size=MAX_AUDIO_REQUEST_SIZE)
 
     # Parse the request JSON
     try:
