@@ -366,12 +366,13 @@ def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
 
 def encrypt_embedding(
     embedding: list, client_public_key: str, signing_algo: str
-) -> str:
+) -> object:
     """
     Encrypt an embedding vector.
-    Serializes the float array to JSON, encrypts, returns hex string.
+    Serializes the float array to JSON, encrypts, and returns a hex string.
+    If the input is not a non-empty list, it is returned unmodified.
     """
-    if not embedding or not isinstance(embedding, list):
+    if not isinstance(embedding, list) or not embedding:
         return embedding
 
     try:
