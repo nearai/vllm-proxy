@@ -17,7 +17,12 @@ sys.modules["app.quote.quote"] = __import__("tests.app.mock_quote", fromlist=[""
 
 # Now we can safely import app code
 from app.main import app
-from app.api.v1.openai import VLLM_URL, VLLM_BASE_URL, VLLM_EMBEDDINGS_URL
+from app.api.v1.openai import (
+    VLLM_URL,
+    VLLM_BASE_URL,
+    VLLM_EMBEDDINGS_URL,
+    VLLM_IMAGES_EDITS_URL,
+)
 from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
 client = TestClient(app)
@@ -1270,3 +1275,252 @@ async def test_embeddings_rejects_oversized_request():
     response_data = response.json()
     assert "detail" in response_data
     assert "Request body too large" in response_data["detail"]
+
+
+# ============================================================================
+# Images Edits Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_success(respx_mock):
+    """Test successful image edit request."""
+    # Mock response data
+    response_id = "img-edit-123"
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                "revised_prompt": "A lovely gift basket with items",
+            }
+        ],
+        "id": response_id,
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Create test image data
+    test_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # Minimal PNG header + padding
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Create a lovely gift basket",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", test_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert len(result["data"]) == 1
+        assert "b64_json" in result["data"][0]
+        assert result["id"] == response_id
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_with_multiple_images(respx_mock):
+    """Test image edit request with multiple images."""
+    response_id = "img-edit-456"
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "b64_json": "base64encodedimage",
+                "revised_prompt": "Combined images",
+            }
+        ],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_image1 = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    test_image2 = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    test_image3 = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Combine these images",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("image1.png", test_image1, "image/png")),
+                ("image[]", ("image2.png", test_image2, "image/png")),
+                ("image[]", ("image3.png", test_image3, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_upstream_error(respx_mock):
+    """Test image edit request when upstream returns error."""
+    error_response = {"error": {"message": "Invalid image", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(400, json=error_response)
+    )
+
+    test_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "Edit this image",
+            "model": "gpt-image-1.5",
+        },
+        files=[
+            ("image[]", ("test.png", test_image, "image/png")),
+        ],
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 400
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_with_request_hash(respx_mock):
+    """Test image edit request with X-Request-Hash header."""
+    expected_hash = "custom-image-edit-hash"
+    response_id = "img-edit-789"
+    response_data = {
+        "created": 1677825464,
+        "data": [{"b64_json": "base64data"}],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Edit this image",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", test_image, "image/png")),
+            ],
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_generates_id_if_missing(respx_mock):
+    """Test that images edits endpoint generates ID if not in response."""
+    response_data = {
+        "created": 1677825464,
+        "data": [{"b64_json": "base64data"}],
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Edit this image",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", test_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("img-")
+        assert len(result["id"]) == 28  # "img-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_images_edits_with_optional_params(respx_mock):
+    """Test image edit request with optional parameters."""
+    response_id = "img-edit-opts"
+    response_data = {
+        "created": 1677825464,
+        "data": [{"b64_json": "base64data"}],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Edit this image",
+                "model": "gpt-image-1.5",
+                "n": "2",
+                "size": "1024x1024",
+                "response_format": "b64_json",
+                "quality": "hd",
+            },
+            files=[
+                ("image[]", ("test.png", test_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called

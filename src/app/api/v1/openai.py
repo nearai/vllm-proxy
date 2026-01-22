@@ -5,7 +5,17 @@ from hashlib import sha256
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -45,6 +55,10 @@ VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 # Image generation endpoint - can be overridden to point to a different service
 VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
+# Image edit endpoint - can be overridden to point to a different service
+VLLM_IMAGES_EDITS_URL = os.getenv(
+    "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
+)
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
@@ -912,6 +926,150 @@ async def images_generations(
         error_detail = response.text
         log.error(
             f"Upstream service error from {VLLM_IMAGES_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response fields if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "data" in response_data and isinstance(response_data["data"], list):
+            for item in response_data["data"]:
+                if "b64_json" in item and item["b64_json"]:
+                    item["b64_json"] = encrypt_text(
+                        item["b64_json"], x_client_pub_key, x_signing_algo
+                    )
+                if "revised_prompt" in item and item["revised_prompt"]:
+                    item["revised_prompt"] = encrypt_text(
+                        item["revised_prompt"], x_client_pub_key, x_signing_algo
+                    )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM images edits
+@router.post("/images/edits", dependencies=[Depends(verify_authorization_header)])
+async def images_edits(
+    request: Request,
+    image: list[UploadFile] = File(..., alias="image[]"),
+    prompt: str = Form(...),
+    model: str = Form(...),
+    n: Optional[int] = Form(None),
+    size: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    user: Optional[str] = Form(None),
+    quality: Optional[str] = Form(None),
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Image edit endpoint with optional end-to-end encryption.
+
+    Accepts multipart/form-data with one or more images and a prompt.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'prompt' field should be encrypted as hex string
+    - Response 'data[].b64_json' and 'data[].revised_prompt' fields will be encrypted
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Decrypt prompt if encryption is enabled
+    decrypted_prompt = prompt
+    if encrypt_enabled:
+        try:
+            decrypted_prompt = _decrypt_field(prompt, context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
+
+    # Calculate request hash from prompt (images are passed through)
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        # Hash the encrypted prompt for consistency with other endpoints
+        request_sha256 = sha256(prompt.encode("utf-8")).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Build multipart data for forwarding
+    files = []
+    for img in image:
+        content = await img.read()
+        # Check total size
+        if len(content) > MAX_IMAGE_REQUEST_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
+            )
+        files.append(("image[]", (img.filename or "image", content, img.content_type)))
+
+    # Build form data
+    data = {
+        "prompt": decrypted_prompt,
+        "model": model,
+    }
+    if n is not None:
+        data["n"] = str(n)
+    if size is not None:
+        data["size"] = size
+    if response_format is not None:
+        data["response_format"] = response_format
+    if user is not None:
+        data["user"] = user
+    if quality is not None:
+        data["quality"] = quality
+
+    # Forward to vLLM images edits endpoint
+    client = get_http_client()
+    response = await client.post(
+        VLLM_IMAGES_EDITS_URL,
+        files=files,
+        data=data,
+        timeout=httpx.Timeout(TIMEOUT),
+    )
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_IMAGES_EDITS_URL}: "
             f"{response.status_code} - {error_detail}"
         )
         raise HTTPException(
