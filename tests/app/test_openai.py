@@ -17,7 +17,7 @@ sys.modules["app.quote.quote"] = __import__("tests.app.mock_quote", fromlist=[""
 
 # Now we can safely import app code
 from app.main import app
-from app.api.v1.openai import VLLM_URL, VLLM_BASE_URL
+from app.api.v1.openai import VLLM_URL, VLLM_BASE_URL, VLLM_EMBEDDINGS_URL
 from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
 client = TestClient(app)
@@ -1008,3 +1008,265 @@ async def test_request_id_header_preserved_from_client(respx_mock):
     assert route.called
     # Verify client's request ID is preserved
     assert response.headers["X-Request-ID"] == client_request_id
+
+
+# ============================================================================
+# Embeddings Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_embeddings_success(respx_mock):
+    """Test successful embeddings request."""
+    # Test request data
+    request_data = {
+        "input": "The food was delicious and the waiter...",
+        "model": "text-embedding-ada-002",
+        "encoding_format": "float",
+    }
+
+    # Mock response data
+    response_id = "emb-123"
+    response_data = {
+        "object": "list",
+        "data": [
+            {
+                "object": "embedding",
+                "embedding": [0.0023064255, -0.009327292, 0.015797734],
+                "index": 0,
+            }
+        ],
+        "model": "text-embedding-ada-002",
+        "usage": {"prompt_tokens": 8, "total_tokens": 8},
+        "id": response_id,
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/embeddings",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["object"] == "list"
+        assert len(result["data"]) == 1
+        assert result["data"][0]["embedding"] == [0.0023064255, -0.009327292, 0.015797734]
+        assert result["id"] == response_id
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_embeddings_with_array_input(respx_mock):
+    """Test embeddings request with array of strings input."""
+    # Test request data with array input
+    request_data = {
+        "input": ["First text", "Second text"],
+        "model": "text-embedding-ada-002",
+    }
+
+    # Mock response data with multiple embeddings
+    response_id = "emb-456"
+    response_data = {
+        "object": "list",
+        "data": [
+            {
+                "object": "embedding",
+                "embedding": [0.001, 0.002, 0.003],
+                "index": 0,
+            },
+            {
+                "object": "embedding",
+                "embedding": [0.004, 0.005, 0.006],
+                "index": 1,
+            },
+        ],
+        "model": "text-embedding-ada-002",
+        "usage": {"prompt_tokens": 10, "total_tokens": 10},
+        "id": response_id,
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/embeddings",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert len(result["data"]) == 2
+        assert result["data"][0]["index"] == 0
+        assert result["data"][1]["index"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_embeddings_upstream_error(respx_mock):
+    """Test embeddings request when upstream returns error."""
+    request_data = {
+        "input": "Test input",
+        "model": "text-embedding-ada-002",
+    }
+
+    # Setup RESPX mock with error
+    error_response = {"error": {"message": "Model not found", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(404, json=error_response)
+    )
+
+    response = client.post(
+        "/v1/embeddings",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    # Verify error response
+    assert response.status_code == 404
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_embeddings_with_request_hash(respx_mock):
+    """Test embeddings request with X-Request-Hash header."""
+    request_data = {
+        "input": "Test input",
+        "model": "text-embedding-ada-002",
+    }
+
+    expected_hash = "custom-embeddings-hash"
+
+    response_id = "emb-789"
+    response_data = {
+        "object": "list",
+        "data": [
+            {
+                "object": "embedding",
+                "embedding": [0.1, 0.2, 0.3],
+                "index": 0,
+            }
+        ],
+        "model": "text-embedding-ada-002",
+        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/embeddings",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_embeddings_generates_id_if_missing(respx_mock):
+    """Test that embeddings endpoint generates ID if not in response."""
+    request_data = {
+        "input": "Test input",
+        "model": "text-embedding-ada-002",
+    }
+
+    # Response without ID
+    response_data = {
+        "object": "list",
+        "data": [
+            {
+                "object": "embedding",
+                "embedding": [0.1, 0.2, 0.3],
+                "index": 0,
+            }
+        ],
+        "model": "text-embedding-ada-002",
+        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+    }
+
+    route = respx_mock.post(VLLM_EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/embeddings",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("emb-")
+        assert len(result["id"]) == 28  # "emb-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+async def test_embeddings_rejects_oversized_request():
+    """Test that embeddings endpoint rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_input = "x" * 1000
+    request_data = {
+        "input": large_input,
+        "model": "text-embedding-ada-002",
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/embeddings",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "Request body too large" in response_data["detail"]

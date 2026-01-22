@@ -45,6 +45,7 @@ VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 # Image generation endpoint - can be overridden to point to a different service
 VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
+VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -361,6 +362,28 @@ def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
     except Exception as e:
         log.error(f"Failed to encrypt text: {type(e).__name__}")
         raise HTTPException(status_code=500, detail="Failed to encrypt text")
+
+
+def encrypt_embedding(
+    embedding: list, client_public_key: str, signing_algo: str
+) -> str:
+    """
+    Encrypt an embedding vector.
+    Serializes the float array to JSON, encrypts, returns hex string.
+    """
+    if not embedding or not isinstance(embedding, list):
+        return embedding
+
+    try:
+        # Serialize embedding to JSON string
+        embedding_json = json.dumps(embedding)
+        encrypted_data = encrypt_data(
+            embedding_json.encode("utf-8"), client_public_key, signing_algo
+        )
+        return encrypted_data.hex()
+    except Exception as e:
+        log.error(f"Failed to encrypt embedding: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Failed to encrypt embedding")
 
 
 async def stream_vllm_response(
@@ -916,6 +939,115 @@ async def images_generations(
     response_id = response_data.get("id")
     if not response_id:
         response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM embeddings
+@router.post("/embeddings", dependencies=[Depends(verify_authorization_header)])
+async def embeddings(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Embeddings endpoint with optional end-to-end encryption.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'input' field should be encrypted as hex string (for string inputs)
+    - Response 'data[].embedding' arrays will be encrypted as hex strings
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt input if encryption is enabled
+    # Input can be: string, array of strings, array of integers, or array of arrays of integers
+    # Only decrypt string inputs, not token IDs (integers)
+    if encrypt_enabled and "input" in request_json:
+        try:
+            request_json["input"] = decrypt_prompt(request_json["input"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt input: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt input")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM embeddings endpoint
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+    client = get_http_client()
+    response = await client.post(VLLM_EMBEDDINGS_URL, content=modified_request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_EMBEDDINGS_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response embeddings if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "data" in response_data and isinstance(response_data["data"], list):
+            for item in response_data["data"]:
+                if "embedding" in item and item["embedding"]:
+                    item["embedding"] = encrypt_embedding(
+                        item["embedding"], x_client_pub_key, x_signing_algo
+                    )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"emb-{uuid.uuid4().hex[:24]}"
         response_data["id"] = response_id
 
     # Hash the response and cache signature
