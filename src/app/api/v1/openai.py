@@ -1058,13 +1058,14 @@ async def images_edits(
         data["quality"] = quality
 
     # Forward to vLLM images edits endpoint
-    client = get_http_client()
-    response = await client.post(
-        VLLM_IMAGES_EDITS_URL,
-        files=files,
-        data=data,
-        timeout=httpx.Timeout(TIMEOUT),
-    )
+    # Use a separate client without Content-Type header for multipart requests
+    # The shared client has Content-Type: application/json which breaks multipart
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as multipart_client:
+        response = await multipart_client.post(
+            VLLM_IMAGES_EDITS_URL,
+            files=files,
+            data=data,
+        )
 
     if response.status_code != 200:
         error_detail = response.text
