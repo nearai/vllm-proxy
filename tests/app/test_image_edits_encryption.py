@@ -783,3 +783,164 @@ async def test_encrypted_image_edits_generates_id_if_missing(respx_mock):
     assert "id" in response_json
     assert response_json["id"].startswith("img-")
     assert len(response_json["id"]) == 28  # "img-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_image_edits_with_background_param(respx_mock):
+    """Test encrypted image edit with background parameter."""
+    plain_prompt = "Make background transparent"
+    encrypted_prompt = encrypt_content(plain_prompt, ECDSA)
+
+    response_id = "img-edit-bg-123"
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "b64_json": "transparentbgimage",
+                "revised_prompt": "Image with transparent background",
+            }
+        ],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": encrypted_prompt,
+                "model": "gpt-image-1.5",
+                "background": "transparent",
+            },
+            files=[
+                ("image[]", ("test.png", TEST_IMAGE, "image/png")),
+            ],
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Signing-Algo": ECDSA,
+                "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+    # Verify background parameter was forwarded
+    call_args = route.calls[0].request
+    assert b"transparent" in call_args.content
+
+    # Verify response is encrypted
+    response_json = response.json()
+    encrypted_b64 = response_json["data"][0]["b64_json"]
+    assert all(c in "0123456789abcdefABCDEF" for c in encrypted_b64)
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_encrypted_image_edits_with_mask(respx_mock):
+    """Test encrypted image edit with mask parameter."""
+    plain_prompt = "Edit the masked area"
+    encrypted_prompt = encrypt_content(plain_prompt, ECDSA)
+
+    response_id = "img-edit-mask-456"
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "b64_json": "editedmaskarea",
+                "revised_prompt": "Edited the masked area of the image",
+            }
+        ],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Create a test mask image (PNG with transparency)
+    mask_image = b"\x89PNG\r\n\x1a\n" + b"\xff" * 100
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": encrypted_prompt,
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", TEST_IMAGE, "image/png")),
+                ("mask", ("mask.png", mask_image, "image/png")),
+            ],
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Signing-Algo": ECDSA,
+                "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.called
+
+    # Verify mask was forwarded (check that it's in the multipart request)
+    call_args = route.calls[0].request
+    assert b"mask" in call_args.content
+
+    # Verify response is encrypted
+    response_json = response.json()
+    encrypted_b64 = response_json["data"][0]["b64_json"]
+    assert all(c in "0123456789abcdefABCDEF" for c in encrypted_b64)
+
+    # Verify we can decrypt
+    decrypted_b64 = decrypt_content(encrypted_b64, ECDSA)
+    assert decrypted_b64 == "editedmaskarea"
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_image_edits_with_mask_no_encryption(respx_mock):
+    """Test image edit with mask but without encryption."""
+    plain_prompt = "Fill in the masked area"
+
+    response_id = "img-edit-mask-plain-789"
+    response_data = {
+        "created": 1677825464,
+        "data": [
+            {
+                "b64_json": "plainmaskresult",
+            }
+        ],
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_IMAGES_EDITS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    mask_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": plain_prompt,
+                "model": "gpt-image-1.5",
+                "background": "opaque",
+            },
+            files=[
+                ("image[]", ("test.png", TEST_IMAGE, "image/png")),
+                ("mask", ("mask.png", mask_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+
+    # Verify response is NOT encrypted (plain text)
+    assert response_json["data"][0]["b64_json"] == "plainmaskresult"

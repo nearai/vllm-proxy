@@ -980,6 +980,8 @@ async def images_edits(
     response_format: Optional[str] = Form(None),
     user: Optional[str] = Form(None),
     quality: Optional[str] = Form(None),
+    background: Optional[str] = Form(None),
+    mask: Optional[UploadFile] = File(None),
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
     x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
     x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
@@ -998,6 +1000,13 @@ async def images_edits(
     When encryption is enabled:
     - Request 'prompt' field should be encrypted as hex string
     - Response 'data[].b64_json' and 'data[].revised_prompt' fields will be encrypted
+
+    Parameters:
+    - image: The image(s) to edit (required)
+    - prompt: Text description of the desired edit (required)
+    - model: The model to use (required)
+    - background: Set transparency for background - 'transparent', 'opaque', or 'auto' (optional)
+    - mask: Additional image indicating where to edit (fully transparent areas) (optional)
     """
     # Check if encryption is requested
     encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
@@ -1056,6 +1065,18 @@ async def images_edits(
         data["user"] = user
     if quality is not None:
         data["quality"] = quality
+    if background is not None:
+        data["background"] = background
+
+    # Add mask file if provided
+    if mask is not None:
+        mask_content = await mask.read()
+        if len(mask_content) > MAX_IMAGE_REQUEST_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Mask image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
+            )
+        files.append(("mask", (mask.filename or "mask.png", mask_content, mask.content_type)))
 
     # Forward to vLLM images edits endpoint
     # Use a separate client without Content-Type header for multipart requests
