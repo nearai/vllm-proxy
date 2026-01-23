@@ -365,16 +365,31 @@ def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
     Encrypt the text field in completions response.
     Returns encrypted text as hex string.
     """
-    if not text or not isinstance(text, str):
+    # Handle None or empty string
+    if text is None or text == "":
+        log.debug("encrypt_text skipping empty/None value")
         return text
 
-    try:
-        encrypted_data = encrypt_data(
-            text.encode("utf-8"), client_public_key, signing_algo
+    # Convert to string if not already (e.g., bytes)
+    if not isinstance(text, str):
+        log.warning(
+            f"encrypt_text received non-string type: {type(text).__name__}, "
+            f"attempting conversion"
         )
-        return encrypted_data.hex()
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        else:
+            text = str(text)
+
+    try:
+        text_bytes = text.encode("utf-8")
+        log.debug(f"encrypt_text: input length={len(text)}, bytes length={len(text_bytes)}")
+        encrypted_data = encrypt_data(text_bytes, client_public_key, signing_algo)
+        result = encrypted_data.hex()
+        log.debug(f"encrypt_text: output length={len(result)}")
+        return result
     except Exception as e:
-        log.error(f"Failed to encrypt text: {type(e).__name__}")
+        log.error(f"Failed to encrypt text: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Failed to encrypt text")
 
 
@@ -940,15 +955,43 @@ async def images_generations(
         assert x_client_pub_key is not None
         assert x_signing_algo is not None
         if "data" in response_data and isinstance(response_data["data"], list):
-            for item in response_data["data"]:
+            for idx, item in enumerate(response_data["data"]):
+                log.debug(
+                    f"Processing image generation response item {idx}, "
+                    f"keys: {list(item.keys())}"
+                )
                 if "b64_json" in item and item["b64_json"]:
+                    b64_value = item["b64_json"]
+                    log.debug(
+                        f"Encrypting b64_json for item {idx}, "
+                        f"type: {type(b64_value).__name__}, "
+                        f"length: {len(b64_value) if isinstance(b64_value, (str, bytes)) else 'N/A'}"
+                    )
                     item["b64_json"] = encrypt_text(
                         item["b64_json"], x_client_pub_key, x_signing_algo
+                    )
+                    log.debug(
+                        f"Encrypted b64_json for item {idx}, "
+                        f"result length: {len(item['b64_json'])}"
+                    )
+                else:
+                    log.debug(
+                        f"Skipping b64_json encryption for item {idx}: "
+                        f"in_item={'b64_json' in item}, "
+                        f"value_truthy={bool(item.get('b64_json'))}"
                     )
                 if "revised_prompt" in item and item["revised_prompt"]:
                     item["revised_prompt"] = encrypt_text(
                         item["revised_prompt"], x_client_pub_key, x_signing_algo
                     )
+        else:
+            log.warning(
+                f"Response data structure unexpected: "
+                f"has_data={'data' in response_data}, "
+                f"data_is_list={isinstance(response_data.get('data'), list)}"
+            )
+    else:
+        log.debug("Encryption not enabled for images/generations response")
 
     # Generate response ID if not present
     response_id = response_data.get("id")
