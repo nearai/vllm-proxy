@@ -5,7 +5,17 @@ from hashlib import sha256
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -45,6 +55,10 @@ VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
 VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
 # Image generation endpoint - can be overridden to point to a different service
 VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
+# Image edit endpoint - can be overridden to point to a different service
+VLLM_IMAGES_EDITS_URL = os.getenv(
+    "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
+)
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
@@ -351,16 +365,31 @@ def encrypt_text(text: str, client_public_key: str, signing_algo: str) -> str:
     Encrypt the text field in completions response.
     Returns encrypted text as hex string.
     """
-    if not text or not isinstance(text, str):
+    # Handle None or empty string
+    if text is None or text == "":
+        log.debug("encrypt_text skipping empty/None value")
         return text
 
-    try:
-        encrypted_data = encrypt_data(
-            text.encode("utf-8"), client_public_key, signing_algo
+    # Convert to string if not already (e.g., bytes)
+    if not isinstance(text, str):
+        log.warning(
+            f"encrypt_text received non-string type: {type(text).__name__}, "
+            f"attempting conversion"
         )
-        return encrypted_data.hex()
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        else:
+            text = str(text)
+
+    try:
+        text_bytes = text.encode("utf-8")
+        log.debug(f"encrypt_text: input length={len(text)}, bytes length={len(text_bytes)}")
+        encrypted_data = encrypt_data(text_bytes, client_public_key, signing_algo)
+        result = encrypted_data.hex()
+        log.debug(f"encrypt_text: output length={len(result)}")
+        return result
     except Exception as e:
-        log.error(f"Failed to encrypt text: {type(e).__name__}")
+        log.error(f"Failed to encrypt text: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Failed to encrypt text")
 
 
@@ -912,6 +941,200 @@ async def images_generations(
         error_detail = response.text
         log.error(
             f"Upstream service error from {VLLM_IMAGES_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response fields if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "data" in response_data and isinstance(response_data["data"], list):
+            for idx, item in enumerate(response_data["data"]):
+                log.debug(
+                    f"Processing image generation response item {idx}, "
+                    f"keys: {list(item.keys())}"
+                )
+                if "b64_json" in item and item["b64_json"]:
+                    b64_value = item["b64_json"]
+                    log.debug(
+                        f"Encrypting b64_json for item {idx}, "
+                        f"type: {type(b64_value).__name__}, "
+                        f"length: {len(b64_value) if isinstance(b64_value, (str, bytes)) else 'N/A'}"
+                    )
+                    item["b64_json"] = encrypt_text(
+                        item["b64_json"], x_client_pub_key, x_signing_algo
+                    )
+                    log.debug(
+                        f"Encrypted b64_json for item {idx}, "
+                        f"result length: {len(item['b64_json'])}"
+                    )
+                else:
+                    log.debug(
+                        f"Skipping b64_json encryption for item {idx}: "
+                        f"in_item={'b64_json' in item}, "
+                        f"value_truthy={bool(item.get('b64_json'))}"
+                    )
+                if "revised_prompt" in item and item["revised_prompt"]:
+                    item["revised_prompt"] = encrypt_text(
+                        item["revised_prompt"], x_client_pub_key, x_signing_algo
+                    )
+        else:
+            log.warning(
+                f"Response data structure unexpected: "
+                f"has_data={'data' in response_data}, "
+                f"data_is_list={isinstance(response_data.get('data'), list)}"
+            )
+    else:
+        log.debug("Encryption not enabled for images/generations response")
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM images edits
+@router.post("/images/edits", dependencies=[Depends(verify_authorization_header)])
+async def images_edits(
+    request: Request,
+    image: list[UploadFile] = File(..., alias="image[]"),
+    prompt: str = Form(...),
+    model: str = Form(...),
+    n: Optional[int] = Form(None),
+    size: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    user: Optional[str] = Form(None),
+    quality: Optional[str] = Form(None),
+    background: Optional[str] = Form(None),
+    mask: Optional[UploadFile] = File(None),
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Image edit endpoint with optional end-to-end encryption.
+
+    Accepts multipart/form-data with one or more images and a prompt.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'prompt' field should be encrypted as hex string
+    - Response 'data[].b64_json' and 'data[].revised_prompt' fields will be encrypted
+
+    Parameters:
+    - image: The image(s) to edit (required)
+    - prompt: Text description of the desired edit (required)
+    - model: The model to use (required)
+    - background: Set transparency for background - 'transparent', 'opaque', or 'auto' (optional)
+    - mask: Additional image indicating where to edit (fully transparent areas) (optional)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Decrypt prompt if encryption is enabled
+    decrypted_prompt = prompt
+    if encrypt_enabled:
+        try:
+            decrypted_prompt = _decrypt_field(prompt, context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
+
+    # Calculate request hash from prompt (images are passed through)
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        # Hash the encrypted prompt for consistency with other endpoints
+        request_sha256 = sha256(prompt.encode("utf-8")).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Build multipart data for forwarding
+    files = []
+    for img in image:
+        content = await img.read()
+        # Check total size
+        if len(content) > MAX_IMAGE_REQUEST_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
+            )
+        files.append(("image[]", (img.filename or "image", content, img.content_type)))
+
+    # Build form data
+    data = {
+        "prompt": decrypted_prompt,
+        "model": model,
+    }
+    if n is not None:
+        data["n"] = str(n)
+    if size is not None:
+        data["size"] = size
+    if response_format is not None:
+        data["response_format"] = response_format
+    if user is not None:
+        data["user"] = user
+    if quality is not None:
+        data["quality"] = quality
+    if background is not None:
+        data["background"] = background
+
+    # Add mask file if provided
+    if mask is not None:
+        mask_content = await mask.read()
+        if len(mask_content) > MAX_IMAGE_REQUEST_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Mask image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
+            )
+        files.append(("mask", (mask.filename or "mask.png", mask_content, mask.content_type)))
+
+    # Forward to vLLM images edits endpoint
+    # Use a separate client without Content-Type header for multipart requests
+    # The shared client has Content-Type: application/json which breaks multipart
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as multipart_client:
+        response = await multipart_client.post(
+            VLLM_IMAGES_EDITS_URL,
+            files=files,
+            data=data,
+        )
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_IMAGES_EDITS_URL}: "
             f"{response.status_code} - {error_detail}"
         )
         raise HTTPException(
