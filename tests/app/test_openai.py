@@ -22,6 +22,7 @@ from app.api.v1.openai import (
     VLLM_BASE_URL,
     VLLM_EMBEDDINGS_URL,
     VLLM_IMAGES_EDITS_URL,
+    VLLM_TRANSCRIPTIONS_URL,
 )
 from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
@@ -1524,3 +1525,243 @@ async def test_images_edits_with_optional_params(respx_mock):
 
         assert response.status_code == 200
         assert route.called
+
+
+# Audio transcriptions tests
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_success(respx_mock):
+    """Test successful audio transcription request."""
+    response_id = "trans-123"
+    response_data = {
+        "text": "Hello, this is a test transcription.",
+        "id": response_id,
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Create test audio data (minimal WAV header + padding)
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["text"] == "Hello, this is a test transcription."
+        assert result["id"] == response_id
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_with_optional_params(respx_mock):
+    """Test audio transcription request with optional parameters."""
+    response_id = "trans-456"
+    response_data = {
+        "text": "Bonjour, ceci est un test.",
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+                "language": "fr",
+                "prompt": "This is a French audio clip",
+                "response_format": "json",
+                "temperature": "0.2",
+            },
+            files=[
+                ("file", ("test.mp3", test_audio, "audio/mpeg")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["text"] == "Bonjour, ceci est un test."
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_upstream_error(respx_mock):
+    """Test audio transcription request when upstream returns error."""
+    error_response = {"error": {"message": "Invalid audio format", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(400, json=error_response)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "whisper-large-v3",
+        },
+        files=[
+            ("file", ("test.wav", test_audio, "audio/wav")),
+        ],
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 400
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_with_request_hash(respx_mock):
+    """Test audio transcription request with X-Request-Hash header."""
+    expected_hash = "custom-transcription-hash"
+    response_id = "trans-789"
+    response_data = {
+        "text": "Test transcription",
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_generates_id_if_missing(respx_mock):
+    """Test that audio transcriptions endpoint generates ID if not in response."""
+    response_data = {
+        "text": "Generated ID test",
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("trans-")
+        assert len(result["id"]) == 30  # "trans-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_verbose_json_format(respx_mock):
+    """Test audio transcription with verbose_json response format."""
+    response_id = "trans-verbose"
+    response_data = {
+        "text": "Hello world",
+        "id": response_id,
+        "task": "transcribe",
+        "language": "english",
+        "duration": 2.5,
+        "segments": [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 2.5,
+                "text": "Hello world",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+                "response_format": "verbose_json",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["text"] == "Hello world"
+        assert result["language"] == "english"
+        assert "segments" in result

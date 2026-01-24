@@ -59,6 +59,10 @@ VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/gener
 VLLM_IMAGES_EDITS_URL = os.getenv(
     "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
 )
+# Audio transcription endpoint - can be overridden to point to a different service
+VLLM_TRANSCRIPTIONS_URL = os.getenv(
+    "VLLM_TRANSCRIPTIONS_URL", f"{VLLM_BASE_URL}/v1/audio/transcriptions"
+)
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
@@ -623,18 +627,20 @@ async def non_stream_vllm_response(
 
     # Cache the request-response pair using the chat ID
     chat_id = response_data.get("id")
-    if chat_id:
-        # Hash the encrypted response (what client receives) for easier verification
-        # Serialize the encrypted response_data to bytes for hashing
-        encrypted_response_body = json.dumps(
-            response_data, separators=(",", ":")
-        ).encode("utf-8")
-        response_sha256 = sha256(encrypted_response_body).hexdigest()
-        cache.set_chat(
-            chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-        )
-    else:
-        raise Exception("Chat id could not be extracted from the response")
+    if not chat_id:
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = chat_id
+        log.debug(f"Generated chat ID: {chat_id}")
+
+    # Hash the encrypted response (what client receives) for easier verification
+    # Serialize the encrypted response_data to bytes for hashing
+    encrypted_response_body = json.dumps(
+        response_data, separators=(",", ":")
+    ).encode("utf-8")
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
 
     return response_data
 
@@ -1163,6 +1169,145 @@ async def images_edits(
     response_id = response_data.get("id")
     if not response_id:
         response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# Audio transcriptions
+@router.post("/audio/transcriptions", dependencies=[Depends(verify_authorization_header)])
+async def audio_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    timestamp_granularities: Optional[str] = Form(None),
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Audio transcription endpoint with optional end-to-end encryption.
+
+    Transcribes audio into the input language.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'prompt' field should be encrypted as hex string
+    - Response 'text' field will be encrypted
+
+    Parameters:
+    - file: The audio file to transcribe (required)
+    - model: ID of the model to use (required)
+    - language: Language of input audio in ISO-639-1 format (optional)
+    - prompt: Optional text to guide the model's style (optional)
+    - response_format: Output format: json, text, srt, verbose_json, vtt (optional)
+    - temperature: Sampling temperature between 0 and 1 (optional)
+    - timestamp_granularities: word, segment, or both (optional)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Decrypt prompt if encryption is enabled and prompt is provided
+    decrypted_prompt = prompt
+    if encrypt_enabled and prompt:
+        try:
+            decrypted_prompt = _decrypt_field(prompt, context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        # Hash based on prompt (if provided) or model name
+        hash_content = (prompt or model).encode("utf-8")
+        request_sha256 = sha256(hash_content).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Read and validate audio file
+    audio_content = await file.read()
+    if len(audio_content) > MAX_AUDIO_REQUEST_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file too large. Maximum: {MAX_AUDIO_REQUEST_SIZE} bytes",
+        )
+
+    # Build multipart data for forwarding
+    files = [("file", (file.filename or "audio", audio_content, file.content_type))]
+
+    # Build form data
+    data = {"model": model}
+    if language is not None:
+        data["language"] = language
+    if decrypted_prompt is not None:
+        data["prompt"] = decrypted_prompt
+    if response_format is not None:
+        data["response_format"] = response_format
+    if temperature is not None:
+        data["temperature"] = str(temperature)
+    if timestamp_granularities is not None:
+        data["timestamp_granularities"] = timestamp_granularities
+
+    # Forward to vLLM transcriptions endpoint
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as multipart_client:
+        response = await multipart_client.post(
+            VLLM_TRANSCRIPTIONS_URL,
+            files=files,
+            data=data,
+        )
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_TRANSCRIPTIONS_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response text if encryption is enabled
+    if encrypt_enabled:
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "text" in response_data and response_data["text"]:
+            response_data["text"] = encrypt_text(
+                response_data["text"], x_client_pub_key, x_signing_algo
+            )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"trans-{uuid.uuid4().hex[:24]}"
         response_data["id"] = response_id
 
     # Hash the response and cache signature

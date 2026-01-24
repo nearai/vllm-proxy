@@ -33,9 +33,21 @@ def setup_verifier_mock():
     sys.modules['verifier'] = mock_verifier
     sys.modules['verifier.cc_admin'] = mock_cc_admin
 
+class MockKeyResponse:
+    """Mock response for get_key calls."""
+    def __init__(self, key_bytes):
+        self._key_bytes = key_bytes
+
+    def decode_key(self):
+        return self._key_bytes
+
+
 class MockDstackClientClass:
     def __init__(self):
         self.last_report_data = None
+        # Generate deterministic 32-byte keys for testing
+        self._ecdsa_key = b'\x01' * 32
+        self._ed25519_key = b'\x02' * 32
 
     def get_quote(self, report_data, *args, **kwargs):
         self.last_report_data = report_data
@@ -43,6 +55,13 @@ class MockDstackClientClass:
 
     def info(self):
         return MockDstackResponse(SAMPLE_DSTACK_INFO)
+
+    def get_key(self, path, purpose="signing"):
+        """Mock key derivation from KMS."""
+        if "ecdsa" in path:
+            return MockKeyResponse(self._ecdsa_key)
+        else:
+            return MockKeyResponse(self._ed25519_key)
 
 def setup_dstack_mock():
     mock_module = MagicMock()
