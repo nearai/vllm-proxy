@@ -174,6 +174,51 @@ async def read_body_with_limit(
     return b"".join(chunks)
 
 
+async def read_upload_file_with_limit(file: UploadFile, max_size: int) -> bytes:
+    """
+    Read an UploadFile with size limit to prevent memory exhaustion attacks.
+
+    This is critical for TEE environments where memory is limited and non-expandable.
+    The function first checks the file.size attribute for early rejection (if available
+    from Content-Length), then streams the file chunk-by-chunk with running size validation.
+
+    Args:
+        file: The FastAPI UploadFile object
+        max_size: Maximum allowed file size in bytes
+
+    Returns:
+        The file content as bytes
+
+    Raises:
+        HTTPException: 413 Payload Too Large if file exceeds max_size
+    """
+    # Check file.size attribute first for early rejection (set from Content-Length)
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum: {max_size} bytes",
+        )
+
+    # Stream the file with size validation
+    chunks: list[bytes] = []
+    total_size = 0
+    chunk_size = 64 * 1024  # 64KB chunks
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum: {max_size} bytes",
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
 def sign_request(request: dict, response: str):
     content = json.dumps(request.get("messages", [])) + "\n" + response
     return quote.sign(content)
@@ -1090,13 +1135,8 @@ async def images_edits(
     # Build multipart data for forwarding
     files = []
     for img in image:
-        content = await img.read()
-        # Check total size
-        if len(content) > MAX_IMAGE_REQUEST_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
-            )
+        # Read image with streaming size validation
+        content = await read_upload_file_with_limit(img, MAX_IMAGE_REQUEST_SIZE)
         files.append(("image[]", (img.filename or "image", content, img.content_type)))
 
     # Build form data
@@ -1119,12 +1159,8 @@ async def images_edits(
 
     # Add mask file if provided
     if mask is not None:
-        mask_content = await mask.read()
-        if len(mask_content) > MAX_IMAGE_REQUEST_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Mask image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
-            )
+        # Read mask with streaming size validation
+        mask_content = await read_upload_file_with_limit(mask, MAX_IMAGE_REQUEST_SIZE)
         files.append(("mask", (mask.filename or "mask.png", mask_content, mask.content_type)))
 
     # Forward to vLLM images edits endpoint
@@ -1246,18 +1282,16 @@ async def audio_transcriptions(
         request_sha256 = x_request_hash
         log.info(f"Using client-provided request hash: {request_sha256}")
     else:
-        # Hash based on prompt (if provided) or model name
+        # Hash the prompt if provided, otherwise fall back to model name.
+        # Note: Audio file content is NOT included in hash for performance reasons
+        # and consistency with /images/edits (which also only hashes the prompt).
+        # The model name provides a stable fallback for prompt-less requests.
         hash_content = (prompt or model).encode("utf-8")
         request_sha256 = sha256(hash_content).hexdigest()
         log.debug(f"Calculated request hash: {request_sha256}")
 
-    # Read and validate audio file
-    audio_content = await file.read()
-    if len(audio_content) > MAX_AUDIO_REQUEST_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Audio file too large. Maximum: {MAX_AUDIO_REQUEST_SIZE} bytes",
-        )
+    # Read and validate audio file with streaming size check
+    audio_content = await read_upload_file_with_limit(file, MAX_AUDIO_REQUEST_SIZE)
 
     # Build multipart data for forwarding
     files = [("file", (file.filename or "audio", audio_content, file.content_type))]

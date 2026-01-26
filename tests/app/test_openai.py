@@ -1765,3 +1765,194 @@ async def test_audio_transcriptions_verbose_json_format(respx_mock):
         assert result["text"] == "Hello world"
         assert result["language"] == "english"
         assert "segments" in result
+
+
+# ============================================================================
+# read_upload_file_with_limit Tests
+# ============================================================================
+
+
+class MockUploadFile:
+    """Mock UploadFile for testing read_upload_file_with_limit."""
+
+    def __init__(self, content: bytes, size: int = None, filename: str = "test.bin"):
+        self._content = content
+        self._position = 0
+        self.size = size  # Simulates Content-Length header
+        self.filename = filename
+        self.content_type = "application/octet-stream"
+
+    async def read(self, size: int = -1) -> bytes:
+        if size == -1:
+            result = self._content[self._position:]
+            self._position = len(self._content)
+        else:
+            result = self._content[self._position:self._position + size]
+            self._position += len(result)
+        return result
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_accepts_valid_file():
+    """Test that read_upload_file_with_limit accepts files within the limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    small_content = b"Hello, this is a small file."
+    mock_file = MockUploadFile(small_content, size=len(small_content))
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == small_content
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_rejects_large_file_by_size_attribute():
+    """Test that read_upload_file_with_limit rejects based on file.size attribute (early check)."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    # File with size attribute exceeding limit - should be rejected before reading
+    large_content = b"X" * 100
+    mock_file = MockUploadFile(large_content, size=999999)  # Size attr says it's huge
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "File too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_rejects_large_file_during_streaming():
+    """Test that read_upload_file_with_limit rejects files exceeding limit during streaming."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    # File without size attribute - must be validated during streaming
+    large_content = b"Y" * 5000  # 5KB content
+    mock_file = MockUploadFile(large_content, size=None)  # No size attribute
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "File too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_handles_empty_file():
+    """Test that read_upload_file_with_limit handles empty files correctly."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    empty_content = b""
+    mock_file = MockUploadFile(empty_content, size=0)
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == b""
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_exact_limit():
+    """Test that read_upload_file_with_limit accepts files at exact size limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    exact_content = b"Z" * 1000  # Exactly at limit
+    mock_file = MockUploadFile(exact_content, size=1000)
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == exact_content
+    assert len(result) == 1000
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_one_byte_over():
+    """Test that read_upload_file_with_limit rejects files just one byte over limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    over_content = b"A" * 1001  # Just one byte over
+    mock_file = MockUploadFile(over_content, size=1001)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+
+
+# ============================================================================
+# Audio Transcriptions File Size Limit Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_audio_transcriptions_rejects_large_file():
+    """Test that audio transcriptions rejects files exceeding MAX_AUDIO_REQUEST_SIZE."""
+    from fastapi import HTTPException
+
+    # Create a mock that raises 413 for large files
+    async def mock_read_with_413(*args, **kwargs):
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum: 100 bytes",
+        )
+
+    # Create oversized audio content
+    large_audio = b"RIFF" + b"\x00" * 500  # Exceeds 100 byte test limit
+
+    with patch(
+        "app.api.v1.openai.read_upload_file_with_limit",
+        side_effect=mock_read_with_413,
+    ):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", large_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Should return 413 Payload Too Large
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "File too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+async def test_images_edits_rejects_large_image():
+    """Test that images edits rejects images exceeding MAX_IMAGE_REQUEST_SIZE."""
+    from fastapi import HTTPException
+
+    # Create a mock that raises 413 for large files
+    async def mock_read_with_413(*args, **kwargs):
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum: 100 bytes",
+        )
+
+    # Create oversized image content
+    large_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 500  # Exceeds 100 byte test limit
+
+    with patch(
+        "app.api.v1.openai.read_upload_file_with_limit",
+        side_effect=mock_read_with_413,
+    ):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Edit this image",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", large_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Should return 413 Payload Too Large
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "File too large" in response_data["detail"]
