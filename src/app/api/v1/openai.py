@@ -66,6 +66,8 @@ VLLM_TRANSCRIPTIONS_URL = os.getenv(
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 # Reranking endpoint - can be overridden to point to a different service
 VLLM_RERANK_URL = os.getenv("VLLM_RERANK_URL", f"{VLLM_BASE_URL}/v1/rerank")
+# Score endpoint - can be overridden to point to a different service
+VLLM_SCORE_URL = os.getenv("VLLM_SCORE_URL", f"{VLLM_BASE_URL}/v1/score")
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -1607,6 +1609,132 @@ async def rerank(
     response_id = response_data.get("id")
     if not response_id:
         response_id = f"rerank-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM score
+@router.post("/score", dependencies=[Depends(verify_authorization_header)])
+async def score(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Score endpoint with optional end-to-end encryption.
+
+    Computes a similarity/relevance score between two texts.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'text_1' and 'text_2' fields should be encrypted as hex strings
+    - Response 'score' field will be encrypted as hex string
+
+    Parameters:
+    - model: The model to use for scoring (required)
+    - text_1: First text (e.g., a query) (required)
+    - text_2: Second text (e.g., a document) (required)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt text_1 if encryption is enabled
+    if encrypt_enabled and "text_1" in request_json:
+        try:
+            request_json["text_1"] = _decrypt_field(request_json["text_1"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt text_1: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt text_1")
+
+    # Decrypt text_2 if encryption is enabled
+    if encrypt_enabled and "text_2" in request_json:
+        try:
+            request_json["text_2"] = _decrypt_field(request_json["text_2"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt text_2: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt text_2")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM score endpoint
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+    client = get_http_client()
+    response = await client.post(VLLM_SCORE_URL, content=modified_request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_SCORE_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response score if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        # Encrypt the score field (convert to string first if it's a number)
+        if "score" in response_data and response_data["score"] is not None:
+            score_value = response_data["score"]
+            # Convert score to string for encryption
+            score_str = json.dumps(score_value)
+            response_data["score"] = encrypt_text(
+                score_str, x_client_pub_key, x_signing_algo
+            )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"score-{uuid.uuid4().hex[:24]}"
         response_data["id"] = response_id
 
     # Hash the response and cache signature
