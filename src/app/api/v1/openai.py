@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import uuid
@@ -58,6 +59,10 @@ VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/gener
 # Image edit endpoint - can be overridden to point to a different service
 VLLM_IMAGES_EDITS_URL = os.getenv(
     "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
+)
+# Audio speech endpoint - can be overridden to point to a different service
+VLLM_SPEECH_URL = os.getenv(
+    "VLLM_SPEECH_URL", f"{VLLM_BASE_URL}/v1/audio/speech"
 )
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
 TIMEOUT = 60 * 10
@@ -1175,6 +1180,141 @@ async def images_edits(
     )
 
     return JSONResponse(content=response_data)
+
+
+# Audio speech
+@router.post("/audio/speech", dependencies=[Depends(verify_authorization_header)])
+async def audio_speech(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Audio speech endpoint with optional end-to-end encryption.
+
+    Converts text to speech with support for multiple voices and formats.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is disabled:
+    - Returns raw binary audio (OpenAI-compatible)
+
+    When encryption is enabled:
+    - Request 'input' field should be encrypted as hex string
+    - Returns JSON response with encrypted audio as base64 hex string
+
+    Parameters:
+    - model: The model to use (required)
+    - input: Text to convert to speech (required, max 4096 characters)
+    - voice: Voice to use (required): alloy, echo, fable, onyx, nova, shimmer
+    - response_format: Audio format (optional): mp3, opus, aac, flac, wav, pcm (default: mp3)
+    - speed: Speaking speed 0.25-4.0 (optional, default: 1.0)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt input text if encryption is enabled
+    if encrypt_enabled and "input" in request_json:
+        try:
+            request_json["input"] = _decrypt_field(request_json["input"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt input: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt input")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM speech endpoint
+    client = get_http_client()
+    response = await client.post(VLLM_SPEECH_URL, content=request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_SPEECH_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    # Read binary audio response
+    audio_bytes = await response.aread()
+    content_type = response.headers.get("content-type", "audio/mpeg")
+
+    # Generate response ID
+    response_id = f"speech-{uuid.uuid4().hex[:24]}"
+
+    # Branch: Encrypted vs Non-Encrypted Response
+    if encrypt_enabled:
+        # Convert to base64
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        # Encrypt the base64 string
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        encrypted_audio = encrypt_text(audio_base64, x_client_pub_key, x_signing_algo)
+
+        # Build JSON response
+        response_data = {
+            "id": response_id,
+            "audio": encrypted_audio,  # hex-encoded encrypted data
+            "format": request_json.get("response_format", "mp3"),
+        }
+
+        # Hash and cache signature
+        encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        response_sha256 = sha256(encrypted_response_body).hexdigest()
+        cache.set_chat(
+            response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        )
+
+        return JSONResponse(content=response_data)
+    else:
+        # Hash binary response for signature
+        response_sha256 = sha256(audio_bytes).hexdigest()
+        cache.set_chat(
+            response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        )
+
+        # Return raw binary with response ID in header
+        return Response(
+            content=audio_bytes,
+            media_type=content_type,
+            headers={"X-Response-ID": response_id},
+        )
 
 
 # VLLM embeddings
