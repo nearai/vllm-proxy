@@ -1226,7 +1226,7 @@ async def audio_speech(
     )
 
     # Use size-limited read to prevent memory exhaustion attacks
-    request_body = await read_body_with_limit(request)
+    request_body = await read_body_with_limit(request, max_size=MAX_AUDIO_REQUEST_SIZE)
 
     # Parse the request JSON
     try:
@@ -1235,6 +1235,64 @@ async def audio_speech(
         raise HTTPException(
             status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
         )
+
+    # Validate required fields
+    required_fields = {"model", "input", "voice"}
+    missing_fields = required_fields - set(request_json.keys())
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required field(s): {', '.join(sorted(missing_fields))}",
+        )
+
+    # Validate input field
+    input_text = request_json.get("input", "")
+    if not isinstance(input_text, str):
+        raise HTTPException(
+            status_code=400, detail="Input field must be a string"
+        )
+    if len(input_text) == 0:
+        raise HTTPException(
+            status_code=400, detail="Input field cannot be empty"
+        )
+    # For non-encrypted requests, validate plaintext length (max 4096 characters)
+    # For encrypted requests, the hex string will be longer due to encryption overhead
+    if not encrypt_enabled and len(input_text) > 4096:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input exceeds maximum length of 4096 characters (got {len(input_text)})",
+        )
+
+    # Validate voice field
+    valid_voices = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+    voice = request_json.get("voice")
+    if voice not in valid_voices:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid voice: {voice}. Must be one of: {', '.join(sorted(valid_voices))}",
+        )
+
+    # Validate response_format if provided
+    if "response_format" in request_json:
+        valid_formats = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
+        response_format = request_json.get("response_format")
+        if response_format not in valid_formats:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid response_format: {response_format}. Must be one of: {', '.join(sorted(valid_formats))}",
+            )
+
+    # Validate speed if provided
+    if "speed" in request_json:
+        try:
+            speed = float(request_json.get("speed"))
+            if not (0.25 <= speed <= 4.0):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Speed must be a number between 0.25 and 4.0",
+            )
 
     # Decrypt input text if encryption is enabled
     if encrypt_enabled and "input" in request_json:
@@ -1247,16 +1305,30 @@ async def audio_speech(
             raise HTTPException(status_code=400, detail="Failed to decrypt input")
 
     # Calculate request hash
+    calculated_request_hash = sha256(request_body).hexdigest()
+
+    # Verify client-provided hash if present
     if x_request_hash:
-        request_sha256 = x_request_hash
-        log.info(f"Using client-provided request hash: {request_sha256}")
+        if x_request_hash != calculated_request_hash:
+            log.warning(
+                f"Request hash mismatch: client provided {x_request_hash}, "
+                f"calculated {calculated_request_hash}"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="X-Request-Hash mismatch with request body",
+            )
+        log.debug(f"Client-provided request hash verified: {x_request_hash}")
     else:
-        request_sha256 = sha256(request_body).hexdigest()
-        log.debug(f"Calculated request hash: {request_sha256}")
+        log.debug(f"Calculated request hash: {calculated_request_hash}")
+
+    request_sha256 = calculated_request_hash
 
     # Forward to vLLM speech endpoint
+    # When encryption is enabled, send the modified request with decrypted input
+    modified_request_body = json.dumps(request_json).encode("utf-8") if encrypt_enabled else request_body
     client = get_http_client()
-    response = await client.post(VLLM_SPEECH_URL, content=request_body)
+    response = await client.post(VLLM_SPEECH_URL, content=modified_request_body)
 
     if response.status_code != 200:
         error_detail = response.text
