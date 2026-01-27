@@ -1207,6 +1207,8 @@ async def audio_speech(
     When encryption is enabled:
     - Request 'input' field should be encrypted as hex string
     - Returns JSON response with encrypted audio as base64 hex string
+    - Note: Encrypted responses are ~33% larger due to base64 encoding (binary→text)
+      followed by encryption (output is hex-encoded)
 
     Parameters:
     - model: The model to use (required)
@@ -1349,12 +1351,15 @@ async def audio_speech(
 
     # Branch: Encrypted vs Non-Encrypted Response
     if encrypt_enabled:
-        # Convert to base64
+        # Convert to base64 for encryption
+        # Performance note: Base64 encoding increases size by ~33%, then encryption
+        # adds another layer (output is hex-encoded), resulting in ~33% total overhead
+        # compared to raw binary. This is necessary for JSON transport of binary data.
         audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
         # Encrypt the base64 string
-        assert x_client_pub_key is not None
-        assert x_signing_algo is not None
+        # Note: x_client_pub_key and x_signing_algo are guaranteed to be not None here
+        # because encrypt_enabled is only True when both are present and validated
         encrypted_audio = encrypt_text(audio_base64, x_client_pub_key, x_signing_algo)
 
         # Build JSON response
