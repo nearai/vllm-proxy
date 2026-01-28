@@ -84,6 +84,7 @@ def setup_test_environment():
     setup_attestation_mock()
     os.environ["TOKEN"] = 'test_token'
     os.environ["SIGNING_METHOD"] = 'ecdsa'
+    os.environ["DEV"] = "true"  # Enable dev mode to use generated keys instead of KMS
 
 # Constants for testing
 TEST_AUTH_HEADER = "Bearer test_token" 
