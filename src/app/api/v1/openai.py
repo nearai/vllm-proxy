@@ -1300,16 +1300,40 @@ async def audio_speech(
     if encrypt_enabled and "input" in request_json:
         try:
             request_json["input"] = _decrypt_field(request_json["input"], context)
+            # Validate decrypted plaintext length (max 4096 characters)
+            # This prevents attackers from encrypting text longer than the limit
+            # to bypass the length check and overload the upstream service
+            decrypted_input = request_json["input"]
+            if not isinstance(decrypted_input, str):
+                raise HTTPException(
+                    status_code=400, detail="Decrypted input must be a string"
+                )
+            if len(decrypted_input) > 4096:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Decrypted input exceeds maximum length of 4096 characters (got {len(decrypted_input)})",
+                )
         except HTTPException:
             raise
         except Exception as e:
             log.error(f"Failed to decrypt input: {type(e).__name__}")
             raise HTTPException(status_code=400, detail="Failed to decrypt input")
 
-    # Calculate request hash
-    calculated_request_hash = sha256(request_body).hexdigest()
+    # Determine what request body to send to upstream
+    # When encryption is enabled, send the decrypted request
+    # When not encrypted, send the original plaintext request
+    upstream_request_body = json.dumps(request_json).encode("utf-8") if encrypt_enabled else request_body
+
+    # Calculate request hash based on what will be sent to upstream service
+    # For encrypted: hash represents the decrypted request sent to vLLM
+    # For non-encrypted: hash represents the plaintext request sent to vLLM
+    # This ensures the hash accurately represents what was forwarded upstream
+    request_hash_body = upstream_request_body
+    calculated_request_hash = sha256(request_hash_body).hexdigest()
 
     # Verify client-provided hash if present
+    # Note: Client must hash the same way - encrypted requests should be hashed before
+    # encryption, or clients should provide the hash of the decrypted content
     if x_request_hash:
         if x_request_hash != calculated_request_hash:
             log.warning(
@@ -1327,10 +1351,8 @@ async def audio_speech(
     request_sha256 = calculated_request_hash
 
     # Forward to vLLM speech endpoint
-    # When encryption is enabled, send the modified request with decrypted input
-    modified_request_body = json.dumps(request_json).encode("utf-8") if encrypt_enabled else request_body
     client = get_http_client()
-    response = await client.post(VLLM_SPEECH_URL, content=modified_request_body)
+    response = await client.post(VLLM_SPEECH_URL, content=upstream_request_body)
 
     if response.status_code != 200:
         error_detail = response.text
@@ -1352,14 +1374,24 @@ async def audio_speech(
     # Branch: Encrypted vs Non-Encrypted Response
     if encrypt_enabled:
         # Convert to base64 for encryption
-        # Performance note: Base64 encoding increases size by ~33%, then encryption
-        # adds another layer (output is hex-encoded), resulting in ~33% total overhead
-        # compared to raw binary. This is necessary for JSON transport of binary data.
+        # Encoding pipeline for encrypted responses:
+        #   1. Binary audio bytes → Base64 string (+33% size)
+        #   2. Base64 string → Encrypt using client public key
+        #   3. Encrypted bytes → Hex string for JSON transport (+100% size, since 2 hex chars per byte)
+        # Total overhead: ~33% for base64 + ~100% for hex = ~2.66x original binary size
+        # This is necessary because:
+        #   - JSON only supports text, not raw binary
+        #   - Client needs to decrypt and decode base64 to recover original audio
         audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
         # Encrypt the base64 string
         # Note: x_client_pub_key and x_signing_algo are guaranteed to be not None here
         # because encrypt_enabled is only True when both are present and validated
+        # Type contracts:
+        #   - audio_base64: str (base64-encoded binary)
+        #   - x_client_pub_key: str (hex-encoded public key)
+        #   - x_signing_algo: str (either 'ecdsa' or 'ed25519')
+        # Returns: str (hex-encoded encrypted data)
         encrypted_audio = encrypt_text(audio_base64, x_client_pub_key, x_signing_algo)
 
         # Build JSON response
