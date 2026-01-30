@@ -1,4 +1,3 @@
-import json
 import os
 from typing import Optional
 
@@ -8,11 +7,9 @@ from .local_cache import LocalCache
 from .redis import RedisCache
 
 CHAT_CACHE_EXPIRATION = int(os.getenv("CHAT_CACHE_EXPIRATION", "1200"))
-MODEL_NAME = os.getenv("MODEL_NAME")
-if not MODEL_NAME:
-    raise ValueError("MODEL_NAME is not set")
 
 CHAT_PREFIX = "chat"
+DEFAULT_NAMESPACE = "default"
 
 
 class ChatCache:
@@ -35,9 +32,10 @@ class ChatCache:
             return None
         return RedisCache(expiration=CHAT_CACHE_EXPIRATION)
 
-    def _make_key(self, prefix: str, key: str) -> str:
-        """Build namespaced cache key: model:prefix:key"""
-        return f"{MODEL_NAME}:{prefix}:{key}"
+    def _make_key(self, prefix: str, key: str, model: Optional[str] = None) -> str:
+        """Build namespaced cache key: model:prefix:key or default:prefix:key"""
+        namespace = model if model else DEFAULT_NAMESPACE
+        return f"{namespace}:{prefix}:{key}"
 
     def _write_string(self, key: str, value: str) -> None:
         """Write string to local and optionally to Redis."""
@@ -65,14 +63,16 @@ class ChatCache:
 
     # Chat operations
 
-    def set_chat(self, chat_id: str, chat: str) -> None:
+    def set_chat(
+        self, chat_id: str, chat: str, model: Optional[str] = None
+    ) -> None:
         """Store chat completion data."""
-        key = self._make_key(CHAT_PREFIX, chat_id)
+        key = self._make_key(CHAT_PREFIX, chat_id, model)
         self._write_string(key, chat)
 
-    def get_chat(self, chat_id: str) -> Optional[str]:
+    def get_chat(self, chat_id: str, model: Optional[str] = None) -> Optional[str]:
         """Retrieve chat completion data."""
-        key = self._make_key(CHAT_PREFIX, chat_id)
+        key = self._make_key(CHAT_PREFIX, chat_id, model)
         return self._read_string(key)
 
 

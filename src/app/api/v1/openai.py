@@ -29,6 +29,8 @@ from app.api.response.response import (
     not_found,
     unexpect_error,
 )
+from app.backend import get_backend_pool
+from app.backend.config import get_backend_config
 from app.cache.cache import cache
 from app.encryption.encryption import (
     decrypt_data,
@@ -47,21 +49,28 @@ from app.quote.quote import (
 
 router = APIRouter(tags=["openai"])
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8000")
-VLLM_URL = f"{VLLM_BASE_URL}/v1/chat/completions"
-VLLM_COMPLETIONS_URL = f"{VLLM_BASE_URL}/v1/completions"
-VLLM_TOKENIZE_URL = f"{VLLM_BASE_URL}/tokenize"
-VLLM_METRICS_URL = f"{VLLM_BASE_URL}/metrics"
-VLLM_MODELS_URL = f"{VLLM_BASE_URL}/v1/models"
-# Image generation endpoint - can be overridden to point to a different service
-VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/generations")
-# Image edit endpoint - can be overridden to point to a different service
-VLLM_IMAGES_EDITS_URL = os.getenv(
-    "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
-)
-VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
+# Timeout settings
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
+
+# Image endpoints can be overridden to point to different services
+# These are resolved lazily using get_backend_config()
+def _get_images_url() -> str:
+    """Get the images generation URL, with optional override."""
+    override = os.getenv("VLLM_IMAGES_URL")
+    if override:
+        return override
+    config = get_backend_config()
+    return f"{config.single_url}/v1/images/generations"
+
+
+def _get_images_edits_url() -> str:
+    """Get the images edits URL, with optional override."""
+    override = os.getenv("VLLM_IMAGES_EDITS_URL")
+    if override:
+        return override
+    config = get_backend_config()
+    return f"{config.single_url}/v1/images/edits"
 
 COMMON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 
@@ -416,6 +425,141 @@ def encrypt_embedding(
         raise HTTPException(status_code=500, detail="Failed to encrypt embedding")
 
 
+def extract_model_from_request(request_json: dict) -> Optional[str]:
+    """
+    Extract the model name from a request JSON body.
+
+    Args:
+        request_json: The parsed request JSON
+
+    Returns:
+        The model name or None if not found
+    """
+    return request_json.get("model")
+
+
+async def select_backend_for_model(model: str) -> str:
+    """
+    Select a backend for the given model.
+
+    Args:
+        model: The model name
+
+    Returns:
+        The backend URL
+
+    Raises:
+        HTTPException: 404 if no backend serves the model
+    """
+    pool = get_backend_pool()
+    backend = await pool.select_backend(model)
+    if not backend:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No backend serves the requested model: {model}",
+        )
+    return backend
+
+
+async def execute_with_retry(
+    model: str,
+    path: str,
+    request_body: bytes,
+    modified_request_body: bytes,
+    request_hash: Optional[str] = None,
+    encrypt_response: bool = False,
+    client_public_key: Optional[str] = None,
+    signing_algo: Optional[str] = None,
+    max_retries: int = 2,
+):
+    """
+    Execute a non-streaming request with retry logic.
+
+    Retries on different backends if the first attempt fails.
+
+    Args:
+        model: The model name for backend selection
+        path: The API path (e.g., /v1/chat/completions)
+        request_body: The original request body
+        modified_request_body: The modified request body to send
+        request_hash: Optional pre-calculated request hash
+        encrypt_response: Whether to encrypt the response
+        client_public_key: Client's public key for encryption
+        signing_algo: Signing algorithm for encryption
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        The response data dict
+
+    Raises:
+        HTTPException: If all backends fail or no backend serves the model
+    """
+    pool = get_backend_pool()
+    exclude_backends: list[str] = []
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries):
+        backend = await pool.select_backend(model, exclude_backends)
+        if not backend:
+            if attempt == 0:
+                # No backend at all for this model
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No backend serves the requested model: {model}",
+                )
+            # All backends exhausted
+            break
+
+        url = pool.build_url(backend, path)
+        log.debug(f"Attempt {attempt + 1}: trying backend {backend} for model {model}")
+
+        try:
+            response_data = await non_stream_vllm_response(
+                url,
+                request_body,
+                modified_request_body,
+                request_hash,
+                encrypt_response,
+                client_public_key,
+                signing_algo,
+                model,
+            )
+            return response_data
+        except HTTPException as e:
+            last_error = e
+            # Only retry on server errors (5xx) or connection errors
+            if e.status_code < 500:
+                raise
+            log.warning(
+                f"Backend {backend} failed with status {e.status_code}, "
+                f"will try another backend"
+            )
+            exclude_backends.append(backend)
+        except Exception as e:
+            last_error = e
+            log.warning(
+                f"Backend {backend} failed with {type(e).__name__}, "
+                f"will try another backend"
+            )
+            exclude_backends.append(backend)
+
+    # All retries exhausted
+    if last_error:
+        if isinstance(last_error, HTTPException):
+            raise HTTPException(
+                status_code=502,
+                detail="All backends failed to process the request",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="All backends failed to process the request",
+        )
+    raise HTTPException(
+        status_code=502,
+        detail="All backends failed to process the request",
+    )
+
+
 async def stream_vllm_response(
     url: str,
     request_body: bytes,
@@ -424,6 +568,7 @@ async def stream_vllm_response(
     encrypt_response: bool = False,
     client_public_key: Optional[str] = None,
     signing_algo: Optional[str] = None,
+    model: Optional[str] = None,
 ):
     """
     Handle streaming vllm request
@@ -437,6 +582,7 @@ async def stream_vllm_response(
         encrypt_response: Whether to encrypt the response chunks
         client_public_key: Client's public key for encryption (required if encrypt_response=True)
         signing_algo: Signing algorithm for encryption (required if encrypt_response=True)
+        model: Optional model name for cache namespacing
     Returns:
         A streaming response (encrypted if encrypt_response=True)
     """
@@ -532,6 +678,7 @@ async def stream_vllm_response(
                 cache.set_chat(
                     chat_id,
                     json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+                    model=model,
                 )
             else:
                 error_message = "Chat id could not be extracted from the response"
@@ -571,10 +718,12 @@ async def non_stream_vllm_response(
     encrypt_response: bool = False,
     client_public_key: Optional[str] = None,
     signing_algo: Optional[str] = None,
+    model: Optional[str] = None,
 ):
     """
     Handle non-streaming responses
     Args:
+        url: The vllm backend URL
         request_body: The original request body
         modified_request_body: The modified enhanced request body
         request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
@@ -583,6 +732,7 @@ async def non_stream_vllm_response(
         encrypt_response: Whether to encrypt the response content
         client_public_key: Client's public key for encryption (required if encrypt_response=True)
         signing_algo: Signing algorithm for encryption (required if encrypt_response=True)
+        model: Optional model name for cache namespacing
     Returns:
         The response data (with encrypted content if encrypt_response=True)
     """
@@ -631,7 +781,9 @@ async def non_stream_vllm_response(
         ).encode("utf-8")
         response_sha256 = sha256(encrypted_response_body).hexdigest()
         cache.set_chat(
-            chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+            chat_id,
+            json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+            model=model,
         )
     else:
         raise Exception("Chat id could not be extracted from the response")
@@ -753,6 +905,11 @@ async def chat_completions(
 
     modified_json = strip_empty_tool_calls(request_json)
 
+    # Extract model for backend routing
+    model = extract_model_from_request(modified_json)
+    if not model:
+        raise HTTPException(status_code=400, detail="Model is required")
+
     # Check if the request is for streaming or non-streaming
     is_stream = modified_json.get(
         "stream", False
@@ -761,20 +918,25 @@ async def chat_completions(
     modified_request_body = json.dumps(modified_json).encode("utf-8")
 
     if is_stream:
-        # Create a streaming response
+        # Streaming: select single backend, no retry (can't retry mid-stream)
+        backend = await select_backend_for_model(model)
+        pool = get_backend_pool()
+        url = pool.build_url(backend, "/v1/chat/completions")
         return await stream_vllm_response(
-            VLLM_URL,
+            url,
             request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
             client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
+            model=model,
         )
     else:
-        # Handle non-streaming response
-        response_data = await non_stream_vllm_response(
-            VLLM_URL,
+        # Non-streaming: use retry logic
+        response_data = await execute_with_retry(
+            model,
+            "/v1/chat/completions",
             request_body,
             modified_request_body,
             x_request_hash,
@@ -840,6 +1002,11 @@ async def completions(
 
     modified_json = strip_empty_tool_calls(request_json)
 
+    # Extract model for backend routing
+    model = extract_model_from_request(modified_json)
+    if not model:
+        raise HTTPException(status_code=400, detail="Model is required")
+
     # Check if the request is for streaming or non-streaming
     is_stream = modified_json.get(
         "stream", False
@@ -848,20 +1015,25 @@ async def completions(
     modified_request_body = json.dumps(modified_json).encode("utf-8")
 
     if is_stream:
-        # Create a streaming response
+        # Streaming: select single backend, no retry (can't retry mid-stream)
+        backend = await select_backend_for_model(model)
+        pool = get_backend_pool()
+        url = pool.build_url(backend, "/v1/completions")
         return await stream_vllm_response(
-            VLLM_COMPLETIONS_URL,
+            url,
             request_body,
             modified_request_body,
             x_request_hash,
             encrypt_response=encrypt_enabled,
             client_public_key=x_client_pub_key if encrypt_enabled else None,
             signing_algo=x_signing_algo if encrypt_enabled else None,
+            model=model,
         )
     else:
-        # Handle non-streaming response
-        response_data = await non_stream_vllm_response(
-            VLLM_COMPLETIONS_URL,
+        # Non-streaming: use retry logic
+        response_data = await execute_with_retry(
+            model,
+            "/v1/completions",
             request_body,
             modified_request_body,
             x_request_hash,
@@ -924,6 +1096,9 @@ async def images_generations(
             log.error(f"Failed to decrypt prompt: {type(e).__name__}")
             raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
 
+    # Extract model for cache namespacing
+    model = extract_model_from_request(request_json)
+
     # Calculate request hash
     if x_request_hash:
         request_sha256 = x_request_hash
@@ -933,14 +1108,15 @@ async def images_generations(
         log.debug(f"Calculated request hash: {request_sha256}")
 
     # Forward to vLLM images endpoint
+    images_url = _get_images_url()
     modified_request_body = json.dumps(request_json).encode("utf-8")
     client = get_http_client()
-    response = await client.post(VLLM_IMAGES_URL, content=modified_request_body)
+    response = await client.post(images_url, content=modified_request_body)
 
     if response.status_code != 200:
         error_detail = response.text
         log.error(
-            f"Upstream service error from {VLLM_IMAGES_URL}: "
+            f"Upstream service error from {images_url}: "
             f"{response.status_code} - {error_detail}"
         )
         raise HTTPException(
@@ -1005,7 +1181,9 @@ async def images_generations(
     )
     response_sha256 = sha256(encrypted_response_body).hexdigest()
     cache.set_chat(
-        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        response_id,
+        json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+        model=model,
     )
 
     return JSONResponse(content=response_data)
@@ -1124,9 +1302,10 @@ async def images_edits(
     # Forward to vLLM images edits endpoint
     # Use a separate client without Content-Type header for multipart requests
     # The shared client has Content-Type: application/json which breaks multipart
+    images_edits_url = _get_images_edits_url()
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as multipart_client:
         response = await multipart_client.post(
-            VLLM_IMAGES_EDITS_URL,
+            images_edits_url,
             files=files,
             data=data,
         )
@@ -1134,7 +1313,7 @@ async def images_edits(
     if response.status_code != 200:
         error_detail = response.text
         log.error(
-            f"Upstream service error from {VLLM_IMAGES_EDITS_URL}: "
+            f"Upstream service error from {images_edits_url}: "
             f"{response.status_code} - {error_detail}"
         )
         raise HTTPException(
@@ -1171,7 +1350,9 @@ async def images_edits(
     )
     response_sha256 = sha256(encrypted_response_body).hexdigest()
     cache.set_chat(
-        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        response_id,
+        json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+        model=model,
     )
 
     return JSONResponse(content=response_data)
@@ -1231,6 +1412,11 @@ async def embeddings(
             log.error(f"Failed to decrypt input: {type(e).__name__}")
             raise HTTPException(status_code=400, detail="Failed to decrypt input")
 
+    # Extract model for backend routing
+    model = extract_model_from_request(request_json)
+    if not model:
+        raise HTTPException(status_code=400, detail="Model is required")
+
     # Calculate request hash
     if x_request_hash:
         request_sha256 = x_request_hash
@@ -1239,15 +1425,19 @@ async def embeddings(
         request_sha256 = sha256(request_body).hexdigest()
         log.debug(f"Calculated request hash: {request_sha256}")
 
-    # Forward to vLLM embeddings endpoint
+    # Select backend and forward to vLLM embeddings endpoint
+    backend = await select_backend_for_model(model)
+    pool = get_backend_pool()
+    embeddings_url = pool.build_url(backend, "/v1/embeddings")
+
     modified_request_body = json.dumps(request_json).encode("utf-8")
     client = get_http_client()
-    response = await client.post(VLLM_EMBEDDINGS_URL, content=modified_request_body)
+    response = await client.post(embeddings_url, content=modified_request_body)
 
     if response.status_code != 200:
         error_detail = response.text
         log.error(
-            f"Upstream service error from {VLLM_EMBEDDINGS_URL}: "
+            f"Upstream service error from {embeddings_url}: "
             f"{response.status_code} - {error_detail}"
         )
         raise HTTPException(
@@ -1280,7 +1470,9 @@ async def embeddings(
     )
     response_sha256 = sha256(encrypted_response_body).hexdigest()
     cache.set_chat(
-        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+        response_id,
+        json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+        model=model,
     )
 
     return JSONResponse(content=response_data)
@@ -1295,9 +1487,26 @@ async def tokenize(request: Request):
     """
     request_body = await read_body_with_limit(request)
 
+    # Parse the request to extract model
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    model = extract_model_from_request(request_json)
+    if not model:
+        raise HTTPException(status_code=400, detail="Model is required")
+
+    # Select backend for the model
+    backend = await select_backend_for_model(model)
+    pool = get_backend_pool()
+    tokenize_url = pool.build_url(backend, "/tokenize")
+
     client = get_http_client()
     response = await client.post(
-        VLLM_TOKENIZE_URL,
+        tokenize_url,
         content=request_body,
         timeout=httpx.Timeout(TIMEOUT_TOKENIZE),
     )
@@ -1350,8 +1559,12 @@ async def signature(request: Request, chat_id: str, signing_algo: str = None):
 # Metrics of vLLM instance
 @router.get("/metrics")
 async def metrics(request: Request):
+    # Metrics endpoint uses the first backend (primary)
+    config = get_backend_config()
+    metrics_url = f"{config.single_url}/metrics"
+
     client = get_http_client()
-    response = await client.get(VLLM_METRICS_URL)
+    response = await client.get(metrics_url)
     if response.status_code != 200:
         raise HTTPException(
             status_code=response.status_code, detail="Failed to fetch metrics"
@@ -1361,10 +1574,15 @@ async def metrics(request: Request):
 
 @router.get("/models")
 async def models(request: Request):
-    client = get_http_client()
-    response = await client.get(VLLM_MODELS_URL)
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code, detail="Failed to fetch models"
-        )
-    return JSONResponse(content=response.json())
+    """
+    Get aggregated list of models from all backends.
+    """
+    pool = get_backend_pool()
+    all_models = await pool.get_all_models()
+
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": all_models,
+        }
+    )

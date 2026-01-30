@@ -10,6 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .api import router as api_router
 from .api.response.response import error, http_exception, ok
 from .api.v1.openai import close_http_client, get_http_client
+from .backend import close_backend_pool, get_backend_pool, init_backend_pool
 from .logger import log
 
 GIT_REV_PATH = "/etc/.GIT_REV"
@@ -48,10 +49,22 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
     # Startup: initialize the HTTP client pool
     log.info("Initializing HTTP client pool...")
-    get_http_client()
+    http_client = get_http_client()
     log.info("HTTP client pool initialized")
+
+    # Initialize backend pool and connect it to the HTTP client
+    log.info("Initializing backend pool...")
+    pool = init_backend_pool()
+    pool.set_http_client(http_client)
+    log.info("Backend pool initialized")
+
     yield
-    # Shutdown: close the HTTP client pool
+
+    # Shutdown: close backend pool first, then HTTP client
+    log.info("Closing backend pool...")
+    await close_backend_pool()
+    log.info("Backend pool closed")
+
     log.info("Closing HTTP client pool...")
     await close_http_client()
     log.info("HTTP client pool closed")
