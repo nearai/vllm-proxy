@@ -23,6 +23,8 @@ from app.api.v1.openai import (
     VLLM_EMBEDDINGS_URL,
     VLLM_IMAGES_EDITS_URL,
     VLLM_TRANSCRIPTIONS_URL,
+    VLLM_RERANK_URL,
+    VLLM_SCORE_URL,
 )
 from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
@@ -1956,3 +1958,522 @@ async def test_images_edits_rejects_large_image():
     response_data = response.json()
     assert "detail" in response_data
     assert "File too large" in response_data["detail"]
+
+
+# ============================================================================
+# Rerank Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_success(respx_mock):
+    """Test successful rerank request."""
+    # Test request data
+    request_data = {
+        "model": "rerank-model",
+        "query": "What is the capital of France?",
+        "documents": [
+            "Paris is the capital of France.",
+            "Berlin is the capital of Germany.",
+            "London is the capital of the UK.",
+        ],
+        "top_n": 3,
+    }
+
+    # Mock response data
+    response_id = "rerank-123"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {
+                "index": 0,
+                "relevance_score": 0.98,
+                "document": {"text": "Paris is the capital of France."},
+            },
+            {
+                "index": 2,
+                "relevance_score": 0.12,
+                "document": {"text": "London is the capital of the UK."},
+            },
+            {
+                "index": 1,
+                "relevance_score": 0.05,
+                "document": {"text": "Berlin is the capital of Germany."},
+            },
+        ],
+        "model": "rerank-model",
+        "usage": {"total_tokens": 50},
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["id"] == response_id
+        assert len(result["results"]) == 3
+        assert result["results"][0]["relevance_score"] == 0.98
+        assert result["results"][0]["document"]["text"] == "Paris is the capital of France."
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_with_document_objects(respx_mock):
+    """Test rerank request with document objects (containing text field)."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "What is the capital of France?",
+        "documents": [
+            {"text": "Paris is the capital of France."},
+            {"text": "Berlin is the capital of Germany."},
+        ],
+    }
+
+    response_id = "rerank-456"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {
+                "index": 0,
+                "relevance_score": 0.95,
+                "document": {"text": "Paris is the capital of France."},
+            },
+            {
+                "index": 1,
+                "relevance_score": 0.10,
+                "document": {"text": "Berlin is the capital of Germany."},
+            },
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert len(result["results"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_upstream_error(respx_mock):
+    """Test rerank request when upstream returns error."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+    }
+
+    error_response = {"error": {"message": "Model not found", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(404, json=error_response)
+    )
+
+    response = client.post(
+        "/v1/rerank",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 404
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_with_request_hash(respx_mock):
+    """Test rerank request with X-Request-Hash header."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+    }
+
+    expected_hash = "custom-rerank-hash"
+    response_id = "rerank-789"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 1, "relevance_score": 0.1},
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_generates_id_if_missing(respx_mock):
+    """Test that rerank endpoint generates ID if not in response."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1"],
+    }
+
+    # Response without ID
+    response_data = {
+        "results": [{"index": 0, "relevance_score": 0.9}],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("rerank-")
+        assert len(result["id"]) == 31  # "rerank-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+async def test_rerank_rejects_oversized_request():
+    """Test that rerank endpoint rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_query = "x" * 1000
+    request_data = {
+        "model": "rerank-model",
+        "query": large_query,
+        "documents": ["Doc 1"],
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "Request body too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_without_return_documents(respx_mock):
+    """Test rerank request with return_documents=false (no document text in response)."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+        "return_documents": False,
+    }
+
+    response_id = "rerank-no-docs"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 1, "relevance_score": 0.1},
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert len(result["results"]) == 2
+        # No document field in results
+        assert "document" not in result["results"][0]
+
+
+# ============================================================================
+# Score Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_success(respx_mock):
+    """Test successful score request."""
+    # Test request data
+    request_data = {
+        "model": "Qwen/Qwen3-Reranker-0.6B",
+        "text_1": "What is the capital of France?",
+        "text_2": "The capital of France is Paris.",
+    }
+
+    # Mock response data
+    response_id = "score-123"
+    response_data = {
+        "id": response_id,
+        "score": 0.95,
+        "model": "Qwen/Qwen3-Reranker-0.6B",
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["id"] == response_id
+        assert result["score"] == 0.95
+        assert result["model"] == "Qwen/Qwen3-Reranker-0.6B"
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_upstream_error(respx_mock):
+    """Test score request when upstream returns error."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query text",
+        "text_2": "Document text",
+    }
+
+    error_response = {"error": {"message": "Model not found", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(404, json=error_response)
+    )
+
+    response = client.post(
+        "/v1/score",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 404
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_with_request_hash(respx_mock):
+    """Test score request with X-Request-Hash header."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query",
+        "text_2": "Document",
+    }
+
+    expected_hash = "custom-score-hash"
+    response_id = "score-789"
+    response_data = {
+        "id": response_id,
+        "score": 0.75,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_generates_id_if_missing(respx_mock):
+    """Test that score endpoint generates ID if not in response."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query",
+        "text_2": "Document",
+    }
+
+    # Response without ID
+    response_data = {
+        "score": 0.85,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("score-")
+        assert len(result["id"]) == 30  # "score-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+async def test_score_rejects_oversized_request():
+    """Test that score endpoint rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_text = "x" * 1000
+    request_data = {
+        "model": "test-model",
+        "text_1": large_text,
+        "text_2": "short",
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "Request body too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_with_negative_score(respx_mock):
+    """Test score request with negative score value."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Unrelated query",
+        "text_2": "Completely different document",
+    }
+
+    response_id = "score-negative"
+    response_data = {
+        "id": response_id,
+        "score": -0.5,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["score"] == -0.5
