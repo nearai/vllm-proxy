@@ -22,6 +22,9 @@ from app.api.v1.openai import (
     VLLM_BASE_URL,
     VLLM_EMBEDDINGS_URL,
     VLLM_IMAGES_EDITS_URL,
+    VLLM_TRANSCRIPTIONS_URL,
+    VLLM_RERANK_URL,
+    VLLM_SCORE_URL,
 )
 from tests.app.mock_quote import ED25519, ECDSA, ecdsa_quote, ed25519_quote
 
@@ -1524,3 +1527,953 @@ async def test_images_edits_with_optional_params(respx_mock):
 
         assert response.status_code == 200
         assert route.called
+
+
+# Audio transcriptions tests
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_success(respx_mock):
+    """Test successful audio transcription request."""
+    response_id = "trans-123"
+    response_data = {
+        "text": "Hello, this is a test transcription.",
+        "id": response_id,
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    # Create test audio data (minimal WAV header + padding)
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["text"] == "Hello, this is a test transcription."
+        assert result["id"] == response_id
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_with_optional_params(respx_mock):
+    """Test audio transcription request with optional parameters."""
+    response_id = "trans-456"
+    response_data = {
+        "text": "Bonjour, ceci est un test.",
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+                "language": "fr",
+                "prompt": "This is a French audio clip",
+                "response_format": "json",
+                "temperature": "0.2",
+            },
+            files=[
+                ("file", ("test.mp3", test_audio, "audio/mpeg")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["text"] == "Bonjour, ceci est un test."
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_upstream_error(respx_mock):
+    """Test audio transcription request when upstream returns error."""
+    error_response = {"error": {"message": "Invalid audio format", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(400, json=error_response)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "whisper-large-v3",
+        },
+        files=[
+            ("file", ("test.wav", test_audio, "audio/wav")),
+        ],
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 400
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_with_request_hash(respx_mock):
+    """Test audio transcription request with X-Request-Hash header."""
+    expected_hash = "custom-transcription-hash"
+    response_id = "trans-789"
+    response_data = {
+        "text": "Test transcription",
+        "id": response_id,
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_generates_id_if_missing(respx_mock):
+    """Test that audio transcriptions endpoint generates ID if not in response."""
+    response_data = {
+        "text": "Generated ID test",
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 50
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("trans-")
+        assert len(result["id"]) == 30  # "trans-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_audio_transcriptions_verbose_json_format(respx_mock):
+    """Test audio transcription with verbose_json response format."""
+    response_id = "trans-verbose"
+    response_data = {
+        "text": "Hello world",
+        "id": response_id,
+        "task": "transcribe",
+        "language": "english",
+        "duration": 2.5,
+        "segments": [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 2.5,
+                "text": "Hello world",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_TRANSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    test_audio = b"RIFF" + b"\x00" * 100
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+                "response_format": "verbose_json",
+            },
+            files=[
+                ("file", ("test.wav", test_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["text"] == "Hello world"
+        assert result["language"] == "english"
+        assert "segments" in result
+
+
+# ============================================================================
+# read_upload_file_with_limit Tests
+# ============================================================================
+
+
+class MockUploadFile:
+    """Mock UploadFile for testing read_upload_file_with_limit."""
+
+    def __init__(self, content: bytes, size: int = None, filename: str = "test.bin"):
+        self._content = content
+        self._position = 0
+        self.size = size  # Simulates Content-Length header
+        self.filename = filename
+        self.content_type = "application/octet-stream"
+
+    async def read(self, size: int = -1) -> bytes:
+        if size == -1:
+            result = self._content[self._position:]
+            self._position = len(self._content)
+        else:
+            result = self._content[self._position:self._position + size]
+            self._position += len(result)
+        return result
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_accepts_valid_file():
+    """Test that read_upload_file_with_limit accepts files within the limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    small_content = b"Hello, this is a small file."
+    mock_file = MockUploadFile(small_content, size=len(small_content))
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == small_content
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_rejects_large_file_by_size_attribute():
+    """Test that read_upload_file_with_limit rejects based on file.size attribute (early check)."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    # File with size attribute exceeding limit - should be rejected before reading
+    large_content = b"X" * 100
+    mock_file = MockUploadFile(large_content, size=999999)  # Size attr says it's huge
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "File too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_rejects_large_file_during_streaming():
+    """Test that read_upload_file_with_limit rejects files exceeding limit during streaming."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    # File without size attribute - must be validated during streaming
+    large_content = b"Y" * 5000  # 5KB content
+    mock_file = MockUploadFile(large_content, size=None)  # No size attribute
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+    assert "File too large" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_handles_empty_file():
+    """Test that read_upload_file_with_limit handles empty files correctly."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    empty_content = b""
+    mock_file = MockUploadFile(empty_content, size=0)
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == b""
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_exact_limit():
+    """Test that read_upload_file_with_limit accepts files at exact size limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+
+    exact_content = b"Z" * 1000  # Exactly at limit
+    mock_file = MockUploadFile(exact_content, size=1000)
+
+    result = await read_upload_file_with_limit(mock_file, max_size=1000)
+    assert result == exact_content
+    assert len(result) == 1000
+
+
+@pytest.mark.asyncio
+async def test_read_upload_file_with_limit_one_byte_over():
+    """Test that read_upload_file_with_limit rejects files just one byte over limit."""
+    from app.api.v1.openai import read_upload_file_with_limit
+    from fastapi import HTTPException
+
+    over_content = b"A" * 1001  # Just one byte over
+    mock_file = MockUploadFile(over_content, size=1001)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await read_upload_file_with_limit(mock_file, max_size=1000)
+
+    assert exc_info.value.status_code == 413
+
+
+# ============================================================================
+# Audio Transcriptions File Size Limit Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_audio_transcriptions_rejects_large_file():
+    """Test that audio transcriptions rejects files exceeding MAX_AUDIO_REQUEST_SIZE."""
+    from fastapi import HTTPException
+
+    # Create a mock that raises 413 for large files
+    async def mock_read_with_413(*args, **kwargs):
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum: 100 bytes",
+        )
+
+    # Create oversized audio content
+    large_audio = b"RIFF" + b"\x00" * 500  # Exceeds 100 byte test limit
+
+    with patch(
+        "app.api.v1.openai.read_upload_file_with_limit",
+        side_effect=mock_read_with_413,
+    ):
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={
+                "model": "whisper-large-v3",
+            },
+            files=[
+                ("file", ("test.wav", large_audio, "audio/wav")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Should return 413 Payload Too Large
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "File too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+async def test_images_edits_rejects_large_image():
+    """Test that images edits rejects images exceeding MAX_IMAGE_REQUEST_SIZE."""
+    from fastapi import HTTPException
+
+    # Create a mock that raises 413 for large files
+    async def mock_read_with_413(*args, **kwargs):
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum: 100 bytes",
+        )
+
+    # Create oversized image content
+    large_image = b"\x89PNG\r\n\x1a\n" + b"\x00" * 500  # Exceeds 100 byte test limit
+
+    with patch(
+        "app.api.v1.openai.read_upload_file_with_limit",
+        side_effect=mock_read_with_413,
+    ):
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "Edit this image",
+                "model": "gpt-image-1.5",
+            },
+            files=[
+                ("image[]", ("test.png", large_image, "image/png")),
+            ],
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    # Should return 413 Payload Too Large
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "File too large" in response_data["detail"]
+
+
+# ============================================================================
+# Rerank Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_success(respx_mock):
+    """Test successful rerank request."""
+    # Test request data
+    request_data = {
+        "model": "rerank-model",
+        "query": "What is the capital of France?",
+        "documents": [
+            "Paris is the capital of France.",
+            "Berlin is the capital of Germany.",
+            "London is the capital of the UK.",
+        ],
+        "top_n": 3,
+    }
+
+    # Mock response data
+    response_id = "rerank-123"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {
+                "index": 0,
+                "relevance_score": 0.98,
+                "document": {"text": "Paris is the capital of France."},
+            },
+            {
+                "index": 2,
+                "relevance_score": 0.12,
+                "document": {"text": "London is the capital of the UK."},
+            },
+            {
+                "index": 1,
+                "relevance_score": 0.05,
+                "document": {"text": "Berlin is the capital of Germany."},
+            },
+        ],
+        "model": "rerank-model",
+        "usage": {"total_tokens": 50},
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["id"] == response_id
+        assert len(result["results"]) == 3
+        assert result["results"][0]["relevance_score"] == 0.98
+        assert result["results"][0]["document"]["text"] == "Paris is the capital of France."
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_with_document_objects(respx_mock):
+    """Test rerank request with document objects (containing text field)."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "What is the capital of France?",
+        "documents": [
+            {"text": "Paris is the capital of France."},
+            {"text": "Berlin is the capital of Germany."},
+        ],
+    }
+
+    response_id = "rerank-456"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {
+                "index": 0,
+                "relevance_score": 0.95,
+                "document": {"text": "Paris is the capital of France."},
+            },
+            {
+                "index": 1,
+                "relevance_score": 0.10,
+                "document": {"text": "Berlin is the capital of Germany."},
+            },
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert len(result["results"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_upstream_error(respx_mock):
+    """Test rerank request when upstream returns error."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+    }
+
+    error_response = {"error": {"message": "Model not found", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(404, json=error_response)
+    )
+
+    response = client.post(
+        "/v1/rerank",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 404
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_with_request_hash(respx_mock):
+    """Test rerank request with X-Request-Hash header."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+    }
+
+    expected_hash = "custom-rerank-hash"
+    response_id = "rerank-789"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 1, "relevance_score": 0.1},
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_generates_id_if_missing(respx_mock):
+    """Test that rerank endpoint generates ID if not in response."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1"],
+    }
+
+    # Response without ID
+    response_data = {
+        "results": [{"index": 0, "relevance_score": 0.9}],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("rerank-")
+        assert len(result["id"]) == 31  # "rerank-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+async def test_rerank_rejects_oversized_request():
+    """Test that rerank endpoint rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_query = "x" * 1000
+    request_data = {
+        "model": "rerank-model",
+        "query": large_query,
+        "documents": ["Doc 1"],
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "Request body too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_rerank_without_return_documents(respx_mock):
+    """Test rerank request with return_documents=false (no document text in response)."""
+    request_data = {
+        "model": "rerank-model",
+        "query": "Test query",
+        "documents": ["Doc 1", "Doc 2"],
+        "return_documents": False,
+    }
+
+    response_id = "rerank-no-docs"
+    response_data = {
+        "id": response_id,
+        "results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 1, "relevance_score": 0.1},
+        ],
+        "model": "rerank-model",
+    }
+
+    route = respx_mock.post(VLLM_RERANK_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/rerank",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert len(result["results"]) == 2
+        # No document field in results
+        assert "document" not in result["results"][0]
+
+
+# ============================================================================
+# Score Endpoint Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_success(respx_mock):
+    """Test successful score request."""
+    # Test request data
+    request_data = {
+        "model": "Qwen/Qwen3-Reranker-0.6B",
+        "text_1": "What is the capital of France?",
+        "text_2": "The capital of France is Paris.",
+    }
+
+    # Mock response data
+    response_id = "score-123"
+    response_data = {
+        "id": response_id,
+        "score": 0.95,
+        "model": "Qwen/Qwen3-Reranker-0.6B",
+    }
+
+    # Setup RESPX mock
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache:
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify response content
+        result = response.json()
+        assert result["id"] == response_id
+        assert result["score"] == 0.95
+        assert result["model"] == "Qwen/Qwen3-Reranker-0.6B"
+
+        # Verify cache was called
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_upstream_error(respx_mock):
+    """Test score request when upstream returns error."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query text",
+        "text_2": "Document text",
+    }
+
+    error_response = {"error": {"message": "Model not found", "type": "invalid_request_error"}}
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(404, json=error_response)
+    )
+
+    response = client.post(
+        "/v1/score",
+        json=request_data,
+        headers={"Authorization": TEST_AUTH_HEADER},
+    )
+
+    assert response.status_code == 404
+    assert route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_with_request_hash(respx_mock):
+    """Test score request with X-Request-Hash header."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query",
+        "text_2": "Document",
+    }
+
+    expected_hash = "custom-score-hash"
+    response_id = "score-789"
+    response_data = {
+        "id": response_id,
+        "score": 0.75,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache") as mock_cache, patch(
+        "app.api.v1.openai.log"
+    ) as mock_log:
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={
+                "Authorization": TEST_AUTH_HEADER,
+                "X-Request-Hash": expected_hash,
+            },
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        # Verify that the client-provided hash was logged
+        mock_log.info.assert_called_with(
+            f"Using client-provided request hash: {expected_hash}"
+        )
+
+        mock_cache.set_chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_generates_id_if_missing(respx_mock):
+    """Test that score endpoint generates ID if not in response."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Query",
+        "text_2": "Document",
+    }
+
+    # Response without ID
+    response_data = {
+        "score": 0.85,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        # Verify ID was generated with correct prefix
+        assert result["id"].startswith("score-")
+        assert len(result["id"]) == 30  # "score-" + 24 hex chars
+
+
+@pytest.mark.asyncio
+async def test_score_rejects_oversized_request():
+    """Test that score endpoint rejects oversized requests."""
+    from app.api.v1.openai import read_body_with_limit
+
+    large_text = "x" * 1000
+    request_data = {
+        "model": "test-model",
+        "text_1": large_text,
+        "text_2": "short",
+    }
+
+    with patch(
+        "app.api.v1.openai.read_body_with_limit",
+        _create_limited_read_body(read_body_with_limit, max_size=100),
+    ):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+    assert response.status_code == 413
+    response_data = response.json()
+    assert "detail" in response_data
+    assert "Request body too large" in response_data["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
+async def test_score_with_negative_score(respx_mock):
+    """Test score request with negative score value."""
+    request_data = {
+        "model": "test-model",
+        "text_1": "Unrelated query",
+        "text_2": "Completely different document",
+    }
+
+    response_id = "score-negative"
+    response_data = {
+        "id": response_id,
+        "score": -0.5,
+        "model": "test-model",
+    }
+
+    route = respx_mock.post(VLLM_SCORE_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    with patch("app.api.v1.openai.cache"):
+        response = client.post(
+            "/v1/score",
+            json=request_data,
+            headers={"Authorization": TEST_AUTH_HEADER},
+        )
+
+        assert response.status_code == 200
+        assert route.called
+
+        result = response.json()
+        assert result["score"] == -0.5

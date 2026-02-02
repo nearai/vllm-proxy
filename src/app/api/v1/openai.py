@@ -59,7 +59,15 @@ VLLM_IMAGES_URL = os.getenv("VLLM_IMAGES_URL", f"{VLLM_BASE_URL}/v1/images/gener
 VLLM_IMAGES_EDITS_URL = os.getenv(
     "VLLM_IMAGES_EDITS_URL", f"{VLLM_BASE_URL}/v1/images/edits"
 )
+# Audio transcription endpoint - can be overridden to point to a different service
+VLLM_TRANSCRIPTIONS_URL = os.getenv(
+    "VLLM_TRANSCRIPTIONS_URL", f"{VLLM_BASE_URL}/v1/audio/transcriptions"
+)
 VLLM_EMBEDDINGS_URL = f"{VLLM_BASE_URL}/v1/embeddings"
+# Reranking endpoint - can be overridden to point to a different service
+VLLM_RERANK_URL = os.getenv("VLLM_RERANK_URL", f"{VLLM_BASE_URL}/v1/rerank")
+# Score endpoint - can be overridden to point to a different service
+VLLM_SCORE_URL = os.getenv("VLLM_SCORE_URL", f"{VLLM_BASE_URL}/v1/score")
 TIMEOUT = 60 * 10
 TIMEOUT_TOKENIZE = 10
 
@@ -167,6 +175,51 @@ async def read_body_with_limit(
                 detail=f"Request body too large. Maximum: {max_size} bytes",
             )
         chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def read_upload_file_with_limit(file: UploadFile, max_size: int) -> bytes:
+    """
+    Read an UploadFile with size limit to prevent memory exhaustion attacks.
+
+    This is critical for TEE environments where memory is limited and non-expandable.
+    The function first checks the file.size attribute for early rejection (if available
+    from Content-Length), then streams the file chunk-by-chunk with running size validation.
+
+    Args:
+        file: The FastAPI UploadFile object
+        max_size: Maximum allowed file size in bytes
+
+    Returns:
+        The file content as bytes
+
+    Raises:
+        HTTPException: 413 Payload Too Large if file exceeds max_size
+    """
+    # Check file.size attribute first for early rejection (set from Content-Length)
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum: {max_size} bytes",
+        )
+
+    # Stream the file with size validation
+    chunks: list[bytes] = []
+    total_size = 0
+    chunk_size = 64 * 1024  # 64KB chunks
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum: {max_size} bytes",
+            )
+        chunks.append(chunk)
+
     return b"".join(chunks)
 
 
@@ -416,6 +469,27 @@ def encrypt_embedding(
         raise HTTPException(status_code=500, detail="Failed to encrypt embedding")
 
 
+def decrypt_rerank_documents(documents: list, context: SigningContext) -> list:
+    """
+    Decrypt documents for reranking.
+    Documents can be strings or objects with a 'text' field.
+    """
+    decrypted_docs = []
+    for doc in documents:
+        if isinstance(doc, str):
+            # Document is a plain string - decrypt it
+            decrypted_docs.append(_decrypt_field(doc, context))
+        elif isinstance(doc, dict) and "text" in doc:
+            # Document is an object with 'text' field - decrypt the text
+            doc_copy = dict(doc)
+            doc_copy["text"] = _decrypt_field(doc["text"], context)
+            decrypted_docs.append(doc_copy)
+        else:
+            # Unknown format - pass through unchanged
+            decrypted_docs.append(doc)
+    return decrypted_docs
+
+
 async def stream_vllm_response(
     url: str,
     request_body: bytes,
@@ -623,18 +697,20 @@ async def non_stream_vllm_response(
 
     # Cache the request-response pair using the chat ID
     chat_id = response_data.get("id")
-    if chat_id:
-        # Hash the encrypted response (what client receives) for easier verification
-        # Serialize the encrypted response_data to bytes for hashing
-        encrypted_response_body = json.dumps(
-            response_data, separators=(",", ":")
-        ).encode("utf-8")
-        response_sha256 = sha256(encrypted_response_body).hexdigest()
-        cache.set_chat(
-            chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-        )
-    else:
-        raise Exception("Chat id could not be extracted from the response")
+    if not chat_id:
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = chat_id
+        log.debug(f"Generated chat ID: {chat_id}")
+
+    # Hash the encrypted response (what client receives) for easier verification
+    # Serialize the encrypted response_data to bytes for hashing
+    encrypted_response_body = json.dumps(
+        response_data, separators=(",", ":")
+    ).encode("utf-8")
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
 
     return response_data
 
@@ -1084,13 +1160,8 @@ async def images_edits(
     # Build multipart data for forwarding
     files = []
     for img in image:
-        content = await img.read()
-        # Check total size
-        if len(content) > MAX_IMAGE_REQUEST_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
-            )
+        # Read image with streaming size validation
+        content = await read_upload_file_with_limit(img, MAX_IMAGE_REQUEST_SIZE)
         files.append(("image[]", (img.filename or "image", content, img.content_type)))
 
     # Build form data
@@ -1113,12 +1184,8 @@ async def images_edits(
 
     # Add mask file if provided
     if mask is not None:
-        mask_content = await mask.read()
-        if len(mask_content) > MAX_IMAGE_REQUEST_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Mask image too large. Maximum: {MAX_IMAGE_REQUEST_SIZE} bytes",
-            )
+        # Read mask with streaming size validation
+        mask_content = await read_upload_file_with_limit(mask, MAX_IMAGE_REQUEST_SIZE)
         files.append(("mask", (mask.filename or "mask.png", mask_content, mask.content_type)))
 
     # Forward to vLLM images edits endpoint
@@ -1163,6 +1230,143 @@ async def images_edits(
     response_id = response_data.get("id")
     if not response_id:
         response_id = f"img-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# Audio transcriptions
+@router.post("/audio/transcriptions", dependencies=[Depends(verify_authorization_header)])
+async def audio_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(None),
+    timestamp_granularities: Optional[str] = Form(None),
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Audio transcription endpoint with optional end-to-end encryption.
+
+    Transcribes audio into the input language.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'prompt' field should be encrypted as hex string
+    - Response 'text' field will be encrypted
+
+    Parameters:
+    - file: The audio file to transcribe (required)
+    - model: ID of the model to use (required)
+    - language: Language of input audio in ISO-639-1 format (optional)
+    - prompt: Optional text to guide the model's style (optional)
+    - response_format: Output format: json, text, srt, verbose_json, vtt (optional)
+    - temperature: Sampling temperature between 0 and 1 (optional)
+    - timestamp_granularities: word, segment, or both (optional)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Decrypt prompt if encryption is enabled and prompt is provided
+    decrypted_prompt = prompt
+    if encrypt_enabled and prompt:
+        try:
+            decrypted_prompt = _decrypt_field(prompt, context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt prompt: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt prompt")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        # Hash the prompt if provided, otherwise fall back to model name.
+        # Note: Audio file content is NOT included in hash for performance reasons
+        # and consistency with /images/edits (which also only hashes the prompt).
+        # The model name provides a stable fallback for prompt-less requests.
+        hash_content = (prompt or model).encode("utf-8")
+        request_sha256 = sha256(hash_content).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Read and validate audio file with streaming size check
+    audio_content = await read_upload_file_with_limit(file, MAX_AUDIO_REQUEST_SIZE)
+
+    # Build multipart data for forwarding
+    files = [("file", (file.filename or "audio", audio_content, file.content_type))]
+
+    # Build form data
+    data = {"model": model}
+    if language is not None:
+        data["language"] = language
+    if decrypted_prompt is not None:
+        data["prompt"] = decrypted_prompt
+    if response_format is not None:
+        data["response_format"] = response_format
+    if temperature is not None:
+        data["temperature"] = str(temperature)
+    if timestamp_granularities is not None:
+        data["timestamp_granularities"] = timestamp_granularities
+
+    # Forward to vLLM transcriptions endpoint
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT)) as multipart_client:
+        response = await multipart_client.post(
+            VLLM_TRANSCRIPTIONS_URL,
+            files=files,
+            data=data,
+        )
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_TRANSCRIPTIONS_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response text if encryption is enabled
+    if encrypt_enabled:
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "text" in response_data and response_data["text"]:
+            response_data["text"] = encrypt_text(
+                response_data["text"], x_client_pub_key, x_signing_algo
+            )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"trans-{uuid.uuid4().hex[:24]}"
         response_data["id"] = response_id
 
     # Hash the response and cache signature
@@ -1272,6 +1476,265 @@ async def embeddings(
     response_id = response_data.get("id")
     if not response_id:
         response_id = f"emb-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM rerank
+@router.post("/rerank", dependencies=[Depends(verify_authorization_header)])
+async def rerank(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Reranking endpoint with optional end-to-end encryption.
+
+    Reranks documents based on their relevance to a query.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'query' field should be encrypted as hex string
+    - Request 'documents' array elements should be encrypted as hex strings
+      (supports both string documents and objects with 'text' field)
+    - Response 'results[].document.text' fields will be encrypted (if return_documents=true)
+
+    Parameters:
+    - model: The model to use for reranking (required)
+    - query: The query to rank documents against (required)
+    - documents: Array of documents to rerank (required)
+      - Can be strings or objects with 'text' field
+    - top_n: Number of top results to return (optional)
+    - return_documents: Whether to include documents in response (optional, default true)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt query if encryption is enabled
+    if encrypt_enabled and "query" in request_json:
+        try:
+            request_json["query"] = _decrypt_field(request_json["query"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt query: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt query")
+
+    # Decrypt documents if encryption is enabled
+    if encrypt_enabled and "documents" in request_json:
+        try:
+            request_json["documents"] = decrypt_rerank_documents(
+                request_json["documents"], context
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt documents: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt documents")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM rerank endpoint
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+    client = get_http_client()
+    response = await client.post(VLLM_RERANK_URL, content=modified_request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_RERANK_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response document text if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        if "results" in response_data and isinstance(response_data["results"], list):
+            for result in response_data["results"]:
+                # Handle document.text field (when return_documents=true)
+                if "document" in result and isinstance(result["document"], dict):
+                    if "text" in result["document"] and result["document"]["text"]:
+                        result["document"]["text"] = encrypt_text(
+                            result["document"]["text"], x_client_pub_key, x_signing_algo
+                        )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"rerank-{uuid.uuid4().hex[:24]}"
+        response_data["id"] = response_id
+
+    # Hash the response and cache signature
+    encrypted_response_body = json.dumps(response_data, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    response_sha256 = sha256(encrypted_response_body).hexdigest()
+    cache.set_chat(
+        response_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
+    )
+
+    return JSONResponse(content=response_data)
+
+
+# VLLM score
+@router.post("/score", dependencies=[Depends(verify_authorization_header)])
+async def score(
+    request: Request,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_signing_algo: Optional[str] = Header(None, alias="X-Signing-Algo"),
+    x_client_pub_key: Optional[str] = Header(None, alias="X-Client-Pub-Key"),
+):
+    """
+    Score endpoint with optional end-to-end encryption.
+
+    Computes a similarity/relevance score between two texts.
+
+    Supports both plain text and encrypted requests/responses.
+
+    Optional encryption headers (both must be provided to enable encryption):
+    - X-Signing-Algo: Either 'ecdsa' or 'ed25519' (required if encryption is enabled)
+    - X-Client-Pub-Key: Client's public key in hex format (required if encryption is enabled)
+
+    When encryption is enabled:
+    - Request 'text_1' and 'text_2' fields should be encrypted as hex strings
+    - Response 'score' field will be encrypted as hex string
+
+    Parameters:
+    - model: The model to use for scoring (required)
+    - text_1: First text (e.g., a query) (required)
+    - text_2: Second text (e.g., a document) (required)
+    """
+    # Check if encryption is requested
+    encrypt_enabled = x_signing_algo is not None and x_client_pub_key is not None
+
+    # Validate encryption headers and get signing context if encryption is enabled
+    context = (
+        validate_encryption_headers(x_signing_algo, x_client_pub_key)
+        if encrypt_enabled
+        else None
+    )
+
+    # Use size-limited read to prevent memory exhaustion attacks
+    request_body = await read_body_with_limit(request)
+
+    # Parse the request JSON
+    try:
+        request_json = json.loads(request_body)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON in request body: {str(e)}"
+        )
+
+    # Decrypt text_1 if encryption is enabled
+    if encrypt_enabled and "text_1" in request_json:
+        try:
+            request_json["text_1"] = _decrypt_field(request_json["text_1"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt text_1: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt text_1")
+
+    # Decrypt text_2 if encryption is enabled
+    if encrypt_enabled and "text_2" in request_json:
+        try:
+            request_json["text_2"] = _decrypt_field(request_json["text_2"], context)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Failed to decrypt text_2: {type(e).__name__}")
+            raise HTTPException(status_code=400, detail="Failed to decrypt text_2")
+
+    # Calculate request hash
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Using client-provided request hash: {request_sha256}")
+    else:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Calculated request hash: {request_sha256}")
+
+    # Forward to vLLM score endpoint
+    modified_request_body = json.dumps(request_json).encode("utf-8")
+    client = get_http_client()
+    response = await client.post(VLLM_SCORE_URL, content=modified_request_body)
+
+    if response.status_code != 200:
+        error_detail = response.text
+        log.error(
+            f"Upstream service error from {VLLM_SCORE_URL}: "
+            f"{response.status_code} - {error_detail}"
+        )
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
+
+    response_data = response.json()
+
+    # Encrypt response score if encryption is enabled
+    if encrypt_enabled:
+        # Type narrowing: encrypt_enabled guarantees these are non-None
+        assert x_client_pub_key is not None
+        assert x_signing_algo is not None
+        # Encrypt the score field (convert to string first if it's a number)
+        if "score" in response_data and response_data["score"] is not None:
+            score_value = response_data["score"]
+            # Convert score to string for encryption
+            score_str = json.dumps(score_value)
+            response_data["score"] = encrypt_text(
+                score_str, x_client_pub_key, x_signing_algo
+            )
+
+    # Generate response ID if not present
+    response_id = response_data.get("id")
+    if not response_id:
+        response_id = f"score-{uuid.uuid4().hex[:24]}"
         response_data["id"] = response_id
 
     # Hash the response and cache signature
