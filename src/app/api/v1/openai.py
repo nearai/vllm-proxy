@@ -88,6 +88,16 @@ def _get_env_as_int(name: str, default: int) -> int:
 MAX_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_CONNECTIONS", 1000)
 MAX_KEEPALIVE_CONNECTIONS = _get_env_as_int("VLLM_PROXY_MAX_KEEPALIVE", 100)
 
+# Backend TLS verification settings
+# VLLM_PROXY_BACKEND_SSL_VERIFY: Set to "false" to disable SSL verification (not recommended for production)
+# VLLM_PROXY_BACKEND_SSL_CA_BUNDLE: Path to CA bundle for verifying backend certificates
+_backend_ssl_verify_env = os.getenv("VLLM_PROXY_BACKEND_SSL_VERIFY", "true").lower()
+BACKEND_SSL_VERIFY: bool | str = _backend_ssl_verify_env not in ("false", "0", "no")
+_backend_ca_bundle = os.getenv("VLLM_PROXY_BACKEND_SSL_CA_BUNDLE")
+if _backend_ca_bundle and BACKEND_SSL_VERIFY:
+    # Use custom CA bundle path instead of boolean True
+    BACKEND_SSL_VERIFY = _backend_ca_bundle
+
 # Maximum request body size (default 10MB) - prevents memory exhaustion attacks
 # Critical for TEE environments with limited memory
 MAX_REQUEST_SIZE = _get_env_as_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024)
@@ -119,6 +129,7 @@ def get_http_client() -> httpx.AsyncClient:
             timeout=httpx.Timeout(TIMEOUT),
             headers=COMMON_HEADERS,
             limits=limits,
+            verify=BACKEND_SSL_VERIFY,
         )
     return _http_client
 
