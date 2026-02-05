@@ -1842,3 +1842,101 @@ async def models(request: Request):
             status_code=response.status_code, detail="Failed to fetch models"
         )
     return JSONResponse(content=response.json())
+
+
+# Catch-all passthrough for undefined endpoints
+# This must be registered LAST to avoid catching defined routes
+@router.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    dependencies=[Depends(verify_authorization_header)],
+)
+async def passthrough(request: Request, path: str):
+    """
+    Passthrough endpoint for any undefined API paths.
+
+    Forwards requests to the backend vLLM service without parsing or modifying them.
+    Useful for supporting new backend endpoints without updating the proxy.
+
+    Note: This endpoint does NOT support end-to-end encryption.
+    For encrypted requests, use the specific endpoint handlers.
+    """
+    # Build the backend URL with path and query string
+    backend_url = f"{VLLM_BASE_URL}/v1/{path}"
+    if request.url.query:
+        backend_url = f"{backend_url}?{request.url.query}"
+
+    log.info(f"Passthrough: {request.method} /v1/{path} -> {backend_url}")
+
+    # Read request body if present (for POST, PUT, PATCH)
+    request_body = None
+    if request.method in ("POST", "PUT", "PATCH"):
+        request_body = await read_body_with_limit(request)
+
+    client = get_http_client()
+
+    # Forward headers (excluding host and content-length which httpx handles)
+    forward_headers = {}
+    for key, value in request.headers.items():
+        key_lower = key.lower()
+        if key_lower not in ("host", "content-length", "transfer-encoding"):
+            forward_headers[key] = value
+
+    # Build and send the request
+    req = client.build_request(
+        method=request.method,
+        url=backend_url,
+        content=request_body,
+        headers=forward_headers,
+    )
+
+    # Check if this might be a streaming request
+    is_stream_request = False
+    if request_body:
+        try:
+            body_json = json.loads(request_body)
+            is_stream_request = body_json.get("stream", False)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    if is_stream_request:
+        # Handle streaming response
+        response = await client.send(req, stream=True)
+
+        if response.status_code != 200:
+            error_content = await response.aread()
+            await response.aclose()
+            return Response(
+                content=error_content,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
+
+        async def generate_stream(resp):
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+
+        # Preserve content-type from backend response
+        content_type = response.headers.get("content-type", "text/event-stream")
+        return StreamingResponse(
+            generate_stream(response),
+            media_type=content_type,
+        )
+    else:
+        # Handle non-streaming response
+        response = await client.send(req)
+
+        # Preserve response headers (excluding transfer-encoding which can cause issues)
+        response_headers = {}
+        for key, value in response.headers.items():
+            if key.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
+                response_headers[key] = value
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+        )
