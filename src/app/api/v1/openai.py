@@ -1851,16 +1851,29 @@ async def models(request: Request):
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
     dependencies=[Depends(verify_authorization_header)],
 )
-async def passthrough(request: Request, path: str):
+async def passthrough(
+    request: Request,
+    path: str,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+):
     """
     Passthrough endpoint for any undefined API paths.
 
     Forwards requests to the backend vLLM service without parsing or modifying them.
     Useful for supporting new backend endpoints without updating the proxy.
 
+    Signature support:
+    - For JSON responses: extracts or injects 'id' field, signs request/response hashes
+    - For SSE streaming: extracts 'id' from first chunk or appends final event with generated id
+    - Signatures can be retrieved via GET /v1/signature/{id}
+
     Note: This endpoint does NOT support end-to-end encryption.
     For encrypted requests, use the specific endpoint handlers.
     """
+    # Prevent path traversal attacks
+    if ".." in path.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+
     # Build the backend URL with path and query string
     backend_url = f"{VLLM_BASE_URL}/v1/{path}"
     if request.url.query:
@@ -1868,75 +1881,170 @@ async def passthrough(request: Request, path: str):
 
     log.info(f"Passthrough: {request.method} /v1/{path} -> {backend_url}")
 
-    # Read request body if present (for POST, PUT, PATCH)
+    # Read request body if present
     request_body = None
     if request.method in ("POST", "PUT", "PATCH"):
         request_body = await read_body_with_limit(request)
 
+    # Calculate request hash for signature
+    if x_request_hash:
+        request_sha256 = x_request_hash
+        log.info(f"Passthrough: Using client-provided request hash: {request_sha256}")
+    elif request_body:
+        request_sha256 = sha256(request_body).hexdigest()
+        log.debug(f"Passthrough: Calculated request hash: {request_sha256}")
+    else:
+        # For GET/DELETE/etc without body, hash the path and query
+        hash_content = f"{path}?{request.url.query}" if request.url.query else path
+        request_sha256 = sha256(hash_content.encode()).hexdigest()
+        log.debug(f"Passthrough: Calculated request hash from path: {request_sha256}")
+
     client = get_http_client()
 
-    # Forward headers (excluding host and content-length which httpx handles)
-    forward_headers = {}
-    for key, value in request.headers.items():
-        key_lower = key.lower()
-        if key_lower not in ("host", "content-length", "transfer-encoding"):
-            forward_headers[key] = value
+    # Forward headers (excluding those httpx handles or that can cause issues)
+    forward_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in ("host", "content-length", "transfer-encoding")
+    }
 
-    # Build and send the request
+    # Build and send the request, always in streaming mode to inspect headers first
     req = client.build_request(
         method=request.method,
         url=backend_url,
         content=request_body,
         headers=forward_headers,
     )
+    response = await client.send(req, stream=True)
 
-    # Check if this might be a streaming request
-    is_stream_request = False
-    if request_body:
-        try:
-            body_json = json.loads(request_body)
-            is_stream_request = body_json.get("stream", False)
-        except (json.JSONDecodeError, AttributeError):
-            pass
+    # Do not expose detailed upstream errors
+    if response.status_code >= 400:
+        await response.aclose()
+        raise HTTPException(
+            status_code=response.status_code, detail="Upstream service error"
+        )
 
-    if is_stream_request:
-        # Handle streaming response
-        response = await client.send(req, stream=True)
+    # Check content type for response handling
+    content_type = response.headers.get("content-type", "")
+    is_stream_response = "text/event-stream" in content_type
+    is_json_response = "application/json" in content_type
 
-        if response.status_code != 200:
-            error_content = await response.aread()
-            await response.aclose()
-            return Response(
-                content=error_content,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-            )
+    if is_stream_response:
+        # Streaming SSE response with signature support
+        response_id = None
+        h = sha256()
 
-        async def generate_stream(resp):
+        async def generate_stream_with_signature(resp):
+            nonlocal response_id, h
             try:
-                async for chunk in resp.aiter_bytes():
+                async for chunk in resp.aiter_text():
+                    # Hash the chunk
+                    h.update(chunk.encode())
+
+                    # Try to extract id from first data chunk if not found yet
+                    if response_id is None and chunk.strip():
+                        # Parse SSE data lines
+                        for line in chunk.split("\n"):
+                            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                                try:
+                                    data = json.loads(line[6:])
+                                    if "id" in data:
+                                        response_id = data["id"]
+                                        break
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+
                     yield chunk
+
+                # After stream completes, sign and cache
+                response_sha256 = h.hexdigest()
+
+                # Generate id if not found in stream
+                final_id = response_id
+                if not final_id:
+                    final_id = f"passthrough-{uuid.uuid4().hex[:24]}"
+                    # Append final SSE event with generated id
+                    final_event = f"data: {{\"id\": \"{final_id}\"}}\n\n"
+                    # Update hash with final event
+                    h.update(final_event.encode())
+                    response_sha256 = h.hexdigest()
+                    yield final_event
+
+                # Cache signature
+                cache.set_chat(
+                    final_id,
+                    json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+                )
+                log.debug(f"Passthrough: Cached signature for streaming response id={final_id}")
+
             finally:
                 await resp.aclose()
 
-        # Preserve content-type from backend response
-        content_type = response.headers.get("content-type", "text/event-stream")
         return StreamingResponse(
-            generate_stream(response),
-            media_type=content_type,
+            generate_stream_with_signature(response),
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type"),
         )
-    else:
-        # Handle non-streaming response
-        response = await client.send(req)
 
-        # Preserve response headers (excluding transfer-encoding which can cause issues)
-        response_headers = {}
-        for key, value in response.headers.items():
-            if key.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
-                response_headers[key] = value
+    elif is_json_response:
+        # Non-streaming JSON response with signature support
+        content = await response.aread()
+        await response.aclose()
+
+        try:
+            response_data = json.loads(content)
+
+            # Extract or generate id
+            response_id = response_data.get("id")
+            if not response_id:
+                response_id = f"passthrough-{uuid.uuid4().hex[:24]}"
+                response_data["id"] = response_id
+                log.debug(f"Passthrough: Generated response id={response_id}")
+
+            # Serialize response for hashing (with injected id if needed)
+            response_body = json.dumps(response_data, separators=(",", ":")).encode("utf-8")
+            response_sha256 = sha256(response_body).hexdigest()
+
+            # Cache signature
+            cache.set_chat(
+                response_id,
+                json.dumps(sign_chat(f"{request_sha256}:{response_sha256}")),
+            )
+            log.debug(f"Passthrough: Cached signature for JSON response id={response_id}")
+
+            return JSONResponse(
+                content=response_data,
+                status_code=response.status_code,
+            )
+
+        except (json.JSONDecodeError, ValueError):
+            # Not valid JSON, return as-is without signature
+            log.warning("Passthrough: JSON response could not be parsed, returning without signature")
+            response_headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in ("transfer-encoding", "content-encoding", "content-length")
+            }
+            return Response(
+                content=content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+    else:
+        # Non-JSON, non-streaming response - return as-is without signature
+        content = await response.aread()
+        await response.aclose()
+
+        # Preserve response headers, excluding those that can cause issues
+        response_headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in ("transfer-encoding", "content-encoding", "content-length")
+        }
 
         return Response(
-            content=response.content,
+            content=content,
             status_code=response.status_code,
             headers=response_headers,
         )
