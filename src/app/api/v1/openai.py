@@ -3,6 +3,7 @@ import os
 import uuid
 from hashlib import sha256
 from typing import Optional
+from urllib.parse import unquote
 
 import httpx
 from fastapi import (
@@ -1863,8 +1864,9 @@ async def handle_passthrough(
     Note: This does NOT support end-to-end encryption.
     For encrypted requests, use the specific endpoint handlers.
     """
-    # Prevent path traversal attacks
-    if ".." in path.split("/"):
+    # Prevent path traversal attacks - decode to catch %2e%2e and %252e%252e variants
+    decoded_path = unquote(path)
+    if ".." in decoded_path.split("/"):
         raise HTTPException(status_code=400, detail="Invalid path")
 
     # Append query string to backend URL
@@ -1874,9 +1876,10 @@ async def handle_passthrough(
     log.info(f"Passthrough: {request.method} {request.url.path} -> {backend_url}")
 
     # Read request body if present
+    # Use MAX_AUDIO_REQUEST_SIZE (largest limit) since passthrough can't know content type
     request_body = None
     if request.method in ("POST", "PUT", "PATCH"):
-        request_body = await read_body_with_limit(request)
+        request_body = await read_body_with_limit(request, max_size=MAX_AUDIO_REQUEST_SIZE)
 
     # Calculate request hash for signature
     if x_request_hash:
@@ -2009,9 +2012,13 @@ async def handle_passthrough(
                 status_code=response.status_code,
             )
 
-        except (json.JSONDecodeError, ValueError):
-            # Not valid JSON, return as-is without signature
-            log.warning("Passthrough: JSON response could not be parsed, returning without signature")
+        except (json.JSONDecodeError, ValueError) as e:
+            # Backend claimed application/json but sent invalid JSON.
+            # Return content as-is but log clearly that signature is unavailable.
+            log.warning(
+                f"Passthrough: Response Content-Type is application/json but body is not "
+                f"valid JSON ({type(e).__name__}). Returning without signature."
+            )
             response_headers = {
                 key: value
                 for key, value in response.headers.items()
