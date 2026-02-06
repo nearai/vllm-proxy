@@ -1844,42 +1844,34 @@ async def models(request: Request):
     return JSONResponse(content=response.json())
 
 
-# Catch-all passthrough for undefined endpoints
-# This must be registered LAST to avoid catching defined routes
-@router.api_route(
-    "/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-    dependencies=[Depends(verify_authorization_header)],
-)
-async def passthrough(
+async def handle_passthrough(
     request: Request,
+    backend_url: str,
     path: str,
-    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+    x_request_hash: Optional[str] = None,
 ):
     """
-    Passthrough endpoint for any undefined API paths.
+    Core passthrough logic shared by /v1/ and root-level catch-all routes.
 
     Forwards requests to the backend vLLM service without parsing or modifying them.
-    Useful for supporting new backend endpoints without updating the proxy.
 
     Signature support:
     - For JSON responses: extracts or injects 'id' field, signs request/response hashes
     - For SSE streaming: extracts 'id' from first chunk or appends final event with generated id
     - Signatures can be retrieved via GET /v1/signature/{id}
 
-    Note: This endpoint does NOT support end-to-end encryption.
+    Note: This does NOT support end-to-end encryption.
     For encrypted requests, use the specific endpoint handlers.
     """
     # Prevent path traversal attacks
     if ".." in path.split("/"):
         raise HTTPException(status_code=400, detail="Invalid path")
 
-    # Build the backend URL with path and query string
-    backend_url = f"{VLLM_BASE_URL}/v1/{path}"
+    # Append query string to backend URL
     if request.url.query:
         backend_url = f"{backend_url}?{request.url.query}"
 
-    log.info(f"Passthrough: {request.method} /v1/{path} -> {backend_url}")
+    log.info(f"Passthrough: {request.method} {request.url.path} -> {backend_url}")
 
     # Read request body if present
     request_body = None
@@ -2048,3 +2040,19 @@ async def passthrough(
             status_code=response.status_code,
             headers=response_headers,
         )
+
+
+# Catch-all passthrough for undefined /v1/ endpoints
+# This must be registered LAST to avoid catching defined routes
+@router.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    dependencies=[Depends(verify_authorization_header)],
+)
+async def passthrough(
+    request: Request,
+    path: str,
+    x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
+):
+    backend_url = f"{VLLM_BASE_URL}/v1/{path}"
+    return await handle_passthrough(request, backend_url, path, x_request_hash)

@@ -3,13 +3,19 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .api import router as api_router
 from .api.response.response import error, http_exception, ok
-from .api.v1.openai import close_http_client, get_http_client
+from .api.v1.openai import (
+    VLLM_BASE_URL,
+    close_http_client,
+    get_http_client,
+    handle_passthrough,
+)
+from .api.helper.auth import verify_authorization_header
 from .logger import log
 
 GIT_REV_PATH = "/etc/.GIT_REV"
@@ -205,3 +211,16 @@ async def global_exception_handler(request: Request, exc: Exception):
         code=None,
         request_id=request_id,
     )
+
+
+# Root-level catch-all passthrough for endpoints outside /v1/
+# This must be registered LAST (after all other routes) to avoid catching defined routes
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    dependencies=[Depends(verify_authorization_header)],
+)
+async def root_passthrough(request: Request, path: str):
+    x_request_hash = request.headers.get("X-Request-Hash")
+    backend_url = f"{VLLM_BASE_URL}/{path}"
+    return await handle_passthrough(request, backend_url, path, x_request_hash)
