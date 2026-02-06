@@ -378,8 +378,8 @@ def encrypt_message_content(
                     )
 
     # Handle Qwen3-Omni audio output: encrypt message.audio.data field
-    if "audio" in message:
-        audio = message.get("audio")
+    if "audio" in message and message.get("audio") is not None:
+        audio = message["audio"]
         if not isinstance(audio, dict):
             raise HTTPException(
                 status_code=400, detail="Invalid audio field: expected object"

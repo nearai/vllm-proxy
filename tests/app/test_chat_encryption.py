@@ -192,6 +192,74 @@ async def test_encrypted_chat_completions_non_streaming_ed25519(respx_mock):
 
 @pytest.mark.asyncio
 @pytest.mark.respx
+async def test_encrypted_chat_completions_non_streaming_audio_null(respx_mock):
+    """Test encrypted non-streaming response with audio: null doesn't crash.
+
+    vLLM non-streaming responses include all message fields, including
+    "audio": null. This must not trigger the audio encryption validation.
+    Regression test for: Invalid audio field: expected object.
+    """
+    plain_content = "Hello, how are you?"
+    encrypted_content = encrypt_content(plain_content, ECDSA)
+
+    request_data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": False,
+    }
+
+    chat_id = "chatcmpl-audio-null-123"
+    response_data = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": 1677825464,
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "I'm doing well, thank you!",
+                    "audio": None,
+                },
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx_mock.post(VLLM_URL).mock(
+        return_value=httpx.Response(200, json=response_data)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_data,
+        headers={
+            "Authorization": TEST_AUTH_HEADER,
+            "X-Signing-Algo": ECDSA,
+            "X-Client-Pub-Key": real_ecdsa_context.signing_public_key,
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.called
+    response_json = response.json()
+
+    assert response_json["id"] == chat_id
+    assert "choices" in response_json
+
+    # Verify response content is encrypted
+    response_content = response_json["choices"][0]["message"]["content"]
+    assert isinstance(response_content, str)
+    assert len(response_content) >= 64
+    assert all(c in "0123456789abcdefABCDEF" for c in response_content)
+
+    # Verify audio field is still null in response
+    assert response_json["choices"][0]["message"]["audio"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx
 async def test_encrypted_chat_completions_with_reasoning_content(respx_mock):
     """Test encrypted chat completions with reasoning_content field."""
     # Encrypt the request content
